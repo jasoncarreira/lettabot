@@ -5,15 +5,17 @@
  */
 
 import { createSession, resumeSession, type Session } from '@letta-ai/letta-code-sdk';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import type { ChannelAdapter } from '../channels/types.js';
-import type { BotConfig, InboundMessage, TriggerContext } from './types.js';
+import type { BotConfig, InboundMessage, OutboundFile, TriggerContext } from './types.js';
 import { Store } from './store.js';
 import { updateAgentName } from '../tools/letta-api.js';
 import { installSkillsToAgent } from '../skills/loader.js';
 import { formatMessageEnvelope } from './formatter.js';
 import { loadMemoryBlocks } from './memory.js';
 import { SYSTEM_PROMPT } from './system-prompt.js';
+import { StreamingDirectiveParser, type AssistantAction } from './directives.js';
 
 export class LettaBot {
   private store: Store;
@@ -166,7 +168,7 @@ export class LettaBot {
     console.log('[Bot] Starting processMessage');
     // Track when user last sent a message (for heartbeat skip logic)
     this.lastUserMessageTime = new Date();
-    
+
     // Track last message target for heartbeat delivery
     this.store.lastMessageTarget = {
       channel: msg.channel,
@@ -182,25 +184,34 @@ export class LettaBot {
     
     // Create or resume session
     let session: Session;
+    let usedDefaultConversation = false;
+    let usedSpecificConversation = false;
     // Base options for all sessions (model only included for new agents)
     const baseOptions = {
       permissionMode: 'bypassPermissions' as const,
       allowedTools: this.config.allowedTools,
       cwd: this.config.workingDir,
       systemPrompt: SYSTEM_PROMPT,
+      // bypassPermissions mode auto-allows all tools, no canUseTool callback needed
     };
     
     console.log('[Bot] Creating/resuming session');
     try {
-      if (this.store.conversationId) {
-        // Resume the specific conversation we've been using
-        console.log(`[Bot] Resuming conversation: ${this.store.conversationId}`);
-        process.env.LETTA_AGENT_ID = this.store.agentId || undefined;
-        session = resumeSession(this.store.conversationId, baseOptions);
-      } else if (this.store.agentId) {
+    if (this.store.conversationId) {
+      // Resume the specific conversation we've been using
+      console.log(`[Bot] Resuming conversation: ${this.store.conversationId}`);
+      process.env.LETTA_AGENT_ID = this.store.agentId || undefined;
+      usedSpecificConversation = true;
+      session = resumeSession(this.store.conversationId, baseOptions);
+    } else if (this.store.agentId) {
         // Agent exists but no conversation - try default conversation
         console.log(`[Bot] Resuming agent default conversation: ${this.store.agentId}`);
         process.env.LETTA_AGENT_ID = this.store.agentId;
+        console.log(`[Bot] Resuming session for agent ${this.store.agentId}`);
+        console.log(`[Bot] LETTA_BASE_URL=${process.env.LETTA_BASE_URL}`);
+        console.log(`[Bot] LETTA_API_KEY=${process.env.LETTA_API_KEY ? '(set)' : '(not set)'}`);
+        // Don't pass model when resuming - agent already has its model configured
+        usedDefaultConversation = true;
         session = resumeSession(this.store.agentId, baseOptions);
       } else {
         // Create new agent with default conversation
@@ -209,13 +220,17 @@ export class LettaBot {
       }
       console.log('[Bot] Session created/resumed');
       
-      const initTimeoutMs = 30000; // 30s timeout
+      const defaultTimeoutMs = 30000; // 30s timeout
+      const envTimeoutMs = Number(process.env.LETTA_SESSION_TIMEOUT_MS);
+      const timeoutMs = Number.isFinite(envTimeoutMs) && envTimeoutMs > 0
+        ? envTimeoutMs
+        : defaultTimeoutMs;
       const withTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
         let timeoutId: NodeJS.Timeout;
         const timeoutPromise = new Promise<T>((_, reject) => {
           timeoutId = setTimeout(() => {
-            reject(new Error(`${label} timed out after ${initTimeoutMs}ms`));
-          }, initTimeoutMs);
+            reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
         });
         try {
           return await Promise.race([promise, timeoutPromise]);
@@ -265,6 +280,7 @@ export class LettaBot {
           throw error;
         }
       }
+      console.log('[Bot] Session initialized, agent:', initInfo.agentId);
       if (initInfo.conversationId && initInfo.conversationId !== this.store.conversationId) {
         this.store.conversationId = initInfo.conversationId;
         console.log('[Bot] Saved conversation ID:', initInfo.conversationId);
@@ -272,197 +288,259 @@ export class LettaBot {
 
       // Send message to agent with metadata envelope
       const formattedMessage = formatMessageEnvelope(msg);
-      try {
-        await withTimeout(session.send(formattedMessage), 'Session send');
-      } catch (sendError) {
-        console.error('[Bot] Error sending message:', sendError);
-        throw sendError;
-      }
-      
-      // Stream response
-      let response = '';
-      let lastUpdate = Date.now();
-      let messageId: string | null = null;
-      let lastMsgType: string | null = null;
-      let lastAssistantUuid: string | null = null;
-      let sentAnyMessage = false;
-      const defaultStreamIdleMs = 60000;
-      const envStreamIdleMs = Number(process.env.LETTA_STREAM_IDLE_TIMEOUT_MS);
-      const streamIdleMs = Number.isFinite(envStreamIdleMs) && envStreamIdleMs > 0
-        ? envStreamIdleMs
-        : defaultStreamIdleMs;
-      let idleTimer: NodeJS.Timeout | null = null;
-      let streamAborted = false;
-      const streamStart = Date.now();
-      let lastStreamChunk = streamStart;
-      const streamLogIntervalMs = 10000;
-      const resetIdleTimer = () => {
-        if (!streamIdleMs) return;
-        if (idleTimer) clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          if (streamAborted) return;
-          streamAborted = true;
-          console.warn(`[Bot] Stream idle timeout after ${streamIdleMs}ms, aborting session...`);
-          session.abort().catch((err) => {
-            console.error('[Bot] Stream abort failed:', err);
-          });
-          try {
-            session.close();
-          } catch (err) {
-            console.error('[Bot] Stream close failed:', err);
-          }
-        }, streamIdleMs);
-      };
-      resetIdleTimer();
-      const streamLogTimer = setInterval(() => {
-        const now = Date.now();
-        const idleMs = now - lastStreamChunk;
-        if (idleMs >= streamLogIntervalMs) {
-          console.log('[Bot] Stream waiting', {
-            elapsedMs: now - streamStart,
-            idleMs,
-          });
-        }
-      }, streamLogIntervalMs);
-      
-      // Helper to finalize and send current accumulated response
-      const finalizeMessage = async () => {
-        if (response.trim()) {
-          try {
-            if (messageId) {
-              await adapter.editMessage(msg.chatId, messageId, response);
-            } else {
-              await adapter.sendMessage({ chatId: msg.chatId, text: response, threadId: msg.threadId });
-            }
-            sentAnyMessage = true;
-            const preview = response.length > 50 ? response.slice(0, 50) + '...' : response;
-            console.log(`[Bot] Sent: "${preview}"`);
-          } catch {
-            // Ignore send errors
-          }
-        }
-        // Reset for next message bubble
-        response = '';
-        messageId = null;
-        lastUpdate = Date.now();
-      };
+
       
       // Keep typing indicator alive
       const typingInterval = setInterval(() => {
         adapter.sendTypingIndicator(msg.chatId).catch(() => {});
       }, 4000);
-      
+
+      let sentAnyMessage = false;
+      const pendingPrompts: string[] = [formattedMessage];
+      let followupCount = 0;
+      const maxFollowups = 3;
+
+      const handleSessionResult = () => {
+        if (session.agentId && session.agentId !== this.store.agentId) {
+          const isNewAgent = !this.store.agentId;
+          const currentBaseUrl = process.env.LETTA_BASE_URL || 'https://api.letta.com';
+          this.store.setAgent(session.agentId, currentBaseUrl, session.conversationId || undefined);
+          console.log('Saved agent ID:', session.agentId, 'conversation ID:', session.conversationId, 'on server:', currentBaseUrl);
+          if (isNewAgent) {
+            if (this.config.agentName) {
+              updateAgentName(session.agentId, this.config.agentName).catch(() => {});
+            }
+            installSkillsToAgent(session.agentId);
+          }
+        } else if (session.conversationId && session.conversationId !== this.store.conversationId) {
+          this.store.conversationId = session.conversationId;
+        }
+      };
+
+      let idleTimer: NodeJS.Timeout | null = null;
+      let streamLogTimer: NodeJS.Timeout | null = null;
       try {
-        for await (const streamMsg of session.stream()) {
-          const msgUuid = (streamMsg as any).uuid;
-          const now = Date.now();
-          const idleMs = now - lastStreamChunk;
-          lastStreamChunk = now;
-          resetIdleTimer();
-          
-          // When message type changes, finalize the current message
-          // This ensures different message types appear as separate bubbles
-          if (lastMsgType && lastMsgType !== streamMsg.type && response.trim()) {
-            await finalizeMessage();
-          }
-          
-          // Log meaningful events
-          if (streamMsg.type !== lastMsgType) {
-            if (streamMsg.type === 'tool_call') {
-              const toolName = (streamMsg as any).toolName || 'unknown';
-              console.log(`[Bot] Calling tool: ${toolName}`);
-            } else if (streamMsg.type === 'tool_result') {
-              console.log(`[Bot] Tool completed`);
-            } else if (streamMsg.type === 'assistant' && lastMsgType !== 'assistant') {
-              console.log(`[Bot] Generating response...`);
-            }
-          }
-          lastMsgType = streamMsg.type;
-          
-          if (streamMsg.type === 'assistant') {
-            // Check if this is a new assistant message (different UUID)
-            if (msgUuid && lastAssistantUuid && msgUuid !== lastAssistantUuid && response.trim()) {
-              await finalizeMessage();
-            }
-            lastAssistantUuid = msgUuid || lastAssistantUuid;
-            
-            response += streamMsg.content;
-            
-            // Stream updates only for channels that support editing (Telegram, Slack)
-            const canEdit = adapter.supportsEditing?.() ?? true;
-            if (canEdit && Date.now() - lastUpdate > 500 && response.length > 0) {
-              try {
-                if (messageId) {
-                  await adapter.editMessage(msg.chatId, messageId, response);
-                } else {
-                  const result = await adapter.sendMessage({ chatId: msg.chatId, text: response, threadId: msg.threadId });
-                  messageId = result.messageId;
-                }
-              } catch {
-                // Ignore edit errors
-              }
-              lastUpdate = Date.now();
-            }
-          }
-          
-          if (streamMsg.type === 'result') {
-            // Save agent ID and conversation ID
-            if (session.agentId && session.agentId !== this.store.agentId) {
-              const isNewAgent = !this.store.agentId;
-              // Save agent ID along with the current server URL
-              const currentBaseUrl = process.env.LETTA_BASE_URL || 'https://api.letta.com';
-              this.store.setAgent(session.agentId, currentBaseUrl, session.conversationId || undefined);
-              console.log('Saved agent ID:', session.agentId, 'conversation ID:', session.conversationId, 'on server:', currentBaseUrl);
-              
-              // Setup new agents: set name, install skills
-              if (isNewAgent) {
-                if (this.config.agentName && session.agentId) {
-                  updateAgentName(session.agentId, this.config.agentName).catch(() => {});
-                }
-                if (session.agentId) {
-                  installSkillsToAgent(session.agentId);
-                }
-              }
-            } else if (session.conversationId && session.conversationId !== this.store.conversationId) {
-              // Update conversation ID if it changed
-              this.store.conversationId = session.conversationId;
-            }
-            break;
+        while (pendingPrompts.length > 0 && followupCount < maxFollowups) {
+          const prompt = pendingPrompts.shift()!;
+          try {
+            console.log(`[Bot] Sending prompt to agent (${prompt.length} chars)...`);
+            await withTimeout(session.send(prompt), 'Session send');
+            console.log('[Bot] Prompt sent, streaming response...');
+          } catch (sendError) {
+            console.error('[Bot] Error sending message:', sendError);
+            throw sendError;
           }
 
+          const parser = new StreamingDirectiveParser();
+          const actions: AssistantAction[] = [];
+          let response = '';
+          let messageId: string | null = null;
+          let lastUpdate = Date.now();
+          const streamStart = Date.now();
+          let lastStreamChunk = streamStart;
+          let lastStreamLog = streamStart;
+          const streamLogIntervalMs = 10000;
+          const typeCounts: Record<string, number> = {};
+          const canEdit = adapter.supportsEditing?.() ?? true;
+          const defaultStreamIdleMs = 60000;
+          const envStreamIdleMs = Number(process.env.LETTA_STREAM_IDLE_TIMEOUT_MS);
+          const streamIdleMs = Number.isFinite(envStreamIdleMs) && envStreamIdleMs > 0
+            ? envStreamIdleMs
+            : defaultStreamIdleMs;
+          idleTimer = null;
+          let streamAborted = false;
+          const resetIdleTimer = () => {
+            if (!streamIdleMs) return;
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+              if (streamAborted) return;
+              streamAborted = true;
+              console.warn(`[Bot] Stream idle timeout after ${streamIdleMs}ms, aborting session...`);
+              session.abort().catch((err) => {
+                console.error('[Bot] Stream abort failed:', err);
+              });
+              try {
+                session.close();
+              } catch (err) {
+                console.error('[Bot] Stream close failed:', err);
+              }
+            }, streamIdleMs);
+          };
+          resetIdleTimer();
+          streamLogTimer = setInterval(() => {
+            const now = Date.now();
+            const idleMs = now - lastStreamChunk;
+            if (idleMs >= streamLogIntervalMs) {
+              console.log('[Bot] Stream waiting', {
+                elapsedMs: now - streamStart,
+                idleMs,
+              });
+            }
+          }, streamLogIntervalMs);
+
+          const sendOrEdit = async (text: string, forceSend = false) => {
+            if (messageId && canEdit && !forceSend) {
+              await adapter.editMessage(msg.chatId, messageId, text);
+              sentAnyMessage = true;
+              return;
+            }
+            const result = await adapter.sendMessage({
+              chatId: msg.chatId,
+              text,
+              threadId: msg.threadId,
+            });
+            messageId = result.messageId;
+            sentAnyMessage = true;
+          };
+
+          for await (const streamMsg of session.stream()) {
+            const now = Date.now();
+            const idleMs = now - lastStreamChunk;
+            lastStreamChunk = now;
+            typeCounts[streamMsg.type] = (typeCounts[streamMsg.type] || 0) + 1;
+            resetIdleTimer();
+
+            if (streamMsg.type === 'assistant') {
+              const parsed = parser.ingest(streamMsg.content);
+              if (parsed.actions.length) {
+                actions.push(...parsed.actions);
+              }
+              if (parsed.text) {
+                response += parsed.text;
+                if (canEdit && Date.now() - lastUpdate > 500 && response.length > 0) {
+                  try {
+                    await sendOrEdit(response);
+                  } catch {
+                    // Ignore edit errors during streaming
+                  }
+                  lastUpdate = Date.now();
+                }
+              }
+            }
+
+            if (streamMsg.type === 'result') {
+              handleSessionResult();
+              break;
+            }
+
+            if (now - lastStreamLog >= streamLogIntervalMs) {
+              console.log('[Bot] Stream heartbeat', {
+                elapsedMs: now - streamStart,
+                idleMs,
+                counts: typeCounts,
+              });
+              lastStreamLog = now;
+            }
+          }
+
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
+          if (streamLogTimer) {
+            clearInterval(streamLogTimer);
+            streamLogTimer = null;
+          }
+          console.log('[Bot] Stream finished', {
+            elapsedMs: Date.now() - streamStart,
+            counts: typeCounts,
+          });
+
+          const tail = parser.flush();
+          if (tail.actions.length) {
+            actions.push(...tail.actions);
+          }
+          if (tail.text) {
+            response += tail.text;
+          }
+
+          if (response.trim()) {
+            try {
+              await sendOrEdit(response, !canEdit);
+            } catch (sendError) {
+              console.error('[Bot] Error sending response:', sendError);
+            }
+          }
+
+          for (const action of actions) {
+            console.log('[Bot] Parsed directive action:', action);
+            if (action.type === 'message') {
+              const chunks = this.splitMessage(action.content, msg.channel);
+              for (const chunk of chunks) {
+                try {
+                  await adapter.sendMessage({
+                    chatId: msg.chatId,
+                    text: chunk,
+                    threadId: msg.threadId,
+                  });
+                  sentAnyMessage = true;
+                } catch (error) {
+                  console.error('[Bot] Send failed:', error);
+                }
+              }
+              continue;
+            }
+
+            if (action.type === 'react') {
+              const targetId = action.messageId || msg.messageId;
+              if (!targetId) {
+                console.warn('[Bot] React directive missing message ID');
+                continue;
+              }
+              const emoji = adapter.id === 'slack'
+                ? action.emoji
+                : this.resolveUnicodeEmoji(action.emoji);
+              try {
+                await adapter.addReaction(msg.chatId, targetId, emoji);
+                sentAnyMessage = true;
+              } catch (error) {
+                console.error('[Bot] Reaction failed:', error);
+              }
+              continue;
+            }
+            if (action.type === 'send_file') {
+              const resolved = this.resolveFilePath(action.path);
+              if (!resolved) {
+                console.warn(`[Bot] File not found: ${action.path}`);
+                continue;
+              }
+              const outbound: OutboundFile = {
+                chatId: msg.chatId,
+                filePath: resolved,
+                kind: action.kind,
+                threadId: msg.threadId,
+              };
+              try {
+                await adapter.sendFile(outbound);
+                sentAnyMessage = true;
+              } catch (error) {
+                console.error('[Bot] File send failed:', error);
+              }
+              continue;
+            }
+
+          }
+
+          followupCount += 1;
         }
       } finally {
         if (idleTimer) {
           clearTimeout(idleTimer);
           idleTimer = null;
         }
-        clearInterval(streamLogTimer);
+        if (streamLogTimer) {
+          clearInterval(streamLogTimer);
+          streamLogTimer = null;
+        }
         clearInterval(typingInterval);
       }
-      
-      // Send final response
-      if (response.trim()) {
-        try {
-          if (messageId) {
-            await adapter.editMessage(msg.chatId, messageId, response);
-          } else {
-            await adapter.sendMessage({ chatId: msg.chatId, text: response, threadId: msg.threadId });
-          }
-          sentAnyMessage = true;
-          const preview = response.length > 50 ? response.slice(0, 50) + '...' : response;
-          console.log(`[Bot] Sent: "${preview}"`);
-        } catch (sendError) {
-          console.error('[Bot] Error sending response:', sendError);
-          if (!messageId) {
-            await adapter.sendMessage({ chatId: msg.chatId, text: response, threadId: msg.threadId });
-            sentAnyMessage = true;
-          }
-        }
-      }
-      
-      // Only show "no response" if we never sent anything
+
       if (!sentAnyMessage) {
-        await adapter.sendMessage({ chatId: msg.chatId, text: '(No response from agent)', threadId: msg.threadId });
+        await adapter.sendMessage({
+          chatId: msg.chatId,
+          text: '(No response from agent)',
+          threadId: msg.threadId,
+        });
       }
       
     } catch (error) {
@@ -475,6 +553,46 @@ export class LettaBot {
     } finally {
       session!?.close();
     }
+  }
+
+  private resolveFilePath(input: string): string | null {
+    const trimmed = input.trim();
+    if (!trimmed) return null;
+    const base = resolve(this.config.workingDir);
+    const resolved = isAbsolute(trimmed)
+      ? resolve(trimmed)
+      : resolve(base, trimmed);
+    const withinBase = resolved === base || resolved.startsWith(`${base}/`);
+    if (!withinBase) {
+      return null;
+    }
+    return existsSync(resolved) ? resolved : null;
+  }
+
+  private splitMessage(content: string, channel: string): string[] {
+    const limits: Record<string, number> = {
+      discord: 1900,
+      telegram: 3900,
+      slack: 38000,
+      whatsapp: 1800,
+      signal: 1800,
+    };
+    const limit = limits[channel] || 1900;
+    if (content.length <= limit) return [content];
+    const chunks: string[] = [];
+    let remaining = content;
+    while (remaining.length > 0) {
+      chunks.push(remaining.slice(0, limit));
+      remaining = remaining.slice(limit);
+    }
+    return chunks;
+  }
+
+  private resolveUnicodeEmoji(input: string): string {
+    const match = input.match(/^:([^:]+):$/);
+    const alias = match ? match[1] : null;
+    const key = alias || input;
+    return EMOJI_ALIAS_TO_UNICODE[key] || input;
   }
   
   /**
@@ -497,14 +615,19 @@ export class LettaBot {
       allowedTools: this.config.allowedTools,
       cwd: this.config.workingDir,
       systemPrompt: SYSTEM_PROMPT,
+      // bypassPermissions mode auto-allows all tools, no canUseTool callback needed
     };
     
     let session: Session;
+    let usedDefaultConversation = false;
+    let usedSpecificConversation = false;
     if (this.store.conversationId) {
       // Resume the specific conversation we've been using
+      usedSpecificConversation = true;
       session = resumeSession(this.store.conversationId, baseOptions);
     } else if (this.store.agentId) {
       // Agent exists but no conversation - try default conversation
+      usedDefaultConversation = true;
       session = resumeSession(this.store.agentId, baseOptions);
     } else {
       // Create new agent with default conversation
@@ -512,10 +635,51 @@ export class LettaBot {
     }
     
     try {
-      await session.send(text);
+      try {
+        await session.send(text);
+      } catch (error) {
+        if (usedSpecificConversation && this.store.agentId) {
+          console.warn('[Bot] Conversation missing, creating a new conversation...');
+          session.close();
+          session = createSession(this.store.agentId, baseOptions);
+          await session.send(text);
+          usedSpecificConversation = false;
+          usedDefaultConversation = false;
+        } else if (usedDefaultConversation && this.store.agentId) {
+          console.warn('[Bot] Default conversation missing, creating a new conversation...');
+          session.close();
+          session = createSession(this.store.agentId, baseOptions);
+          await session.send(text);
+          usedDefaultConversation = false;
+        } else {
+          throw error;
+        }
+      }
       
       let response = '';
+      const defaultStreamIdleMs = 60000;
+      const envStreamIdleMs = Number(process.env.LETTA_STREAM_IDLE_TIMEOUT_MS);
+      const streamIdleMs = Number.isFinite(envStreamIdleMs) && envStreamIdleMs > 0
+        ? envStreamIdleMs
+        : defaultStreamIdleMs;
+      let idleTimer: NodeJS.Timeout | null = null;
+      let streamAborted = false;
+      const resetIdleTimer = () => {
+        if (!streamIdleMs) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (streamAborted) return;
+          streamAborted = true;
+          console.warn(`[Bot] Stream idle timeout after ${streamIdleMs}ms, aborting session...`);
+          session.abort().catch((err) => {
+            console.error('[Bot] Stream abort failed:', err);
+          });
+          session.close();
+        }, streamIdleMs);
+      };
+      resetIdleTimer();
       for await (const msg of session.stream()) {
+        resetIdleTimer();
         if (msg.type === 'assistant') {
           response += msg.content;
         }
@@ -529,6 +693,10 @@ export class LettaBot {
           }
           break;
         }
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
       }
       
       return response;
@@ -574,7 +742,7 @@ export class LettaBot {
   getLastMessageTarget(): { channel: string; chatId: string } | null {
     return this.store.lastMessageTarget || null;
   }
-  
+
   /**
    * Get the time of the last user message (for heartbeat skip logic)
    */
@@ -582,3 +750,17 @@ export class LettaBot {
     return this.lastUserMessageTime;
   }
 }
+
+const EMOJI_ALIAS_TO_UNICODE: Record<string, string> = {
+  eyes: '👀',
+  thumbsup: '👍',
+  thumbs_up: '👍',
+  '+1': '👍',
+  heart: '❤️',
+  fire: '🔥',
+  smile: '😄',
+  laughing: '😆',
+  tada: '🎉',
+  clap: '👏',
+  ok_hand: '👌',
+};

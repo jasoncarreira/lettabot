@@ -6,7 +6,7 @@
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, OutboundMessage } from '../core/types.js';
+import type { HistoryEntry, InboundAttachment, InboundMessage, OutboundFile, OutboundMessage } from '../core/types.js';
 import type { DmPolicy } from '../pairing/types.js';
 import {
   isUserAllowed,
@@ -226,6 +226,11 @@ This code expires in 1 hour.`;
       messageId: timestamp ? String(timestamp) : 'unknown',
     };
   }
+
+  async sendFile(_file: OutboundFile): Promise<{ messageId: string }> {
+    // Signal file sending not implemented in this adapter.
+    return { messageId: '' };
+  }
   
   supportsEditing(): boolean {
     return false;
@@ -233,6 +238,15 @@ This code expires in 1 hour.`;
   
   async editMessage(_chatId: string, _messageId: string, _text: string): Promise<void> {
     // Signal doesn't support editing messages - no-op
+  }
+
+  async addReaction(_chatId: string, _messageId: string, _emoji: string): Promise<void> {
+    // Signal reactions not supported in this adapter.
+  }
+
+  async fetchHistory(_chatId: string, _options: { limit: number; before?: string }): Promise<HistoryEntry[]> {
+    // Signal history fetching not supported in this adapter.
+    return [];
   }
   
   async sendTypingIndicator(chatId: string): Promise<void> {

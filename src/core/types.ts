@@ -90,6 +90,27 @@ export interface OutboundMessage {
 }
 
 /**
+ * Outbound file/image to any channel.
+ */
+export interface OutboundFile {
+  chatId: string;
+  filePath: string;
+  caption?: string;
+  threadId?: string;
+  kind?: 'image' | 'file';
+}
+
+/**
+ * History entry for fetch history directives.
+ */
+export interface HistoryEntry {
+  messageId?: string;
+  author?: string;
+  text: string;
+  timestamp?: string;
+}
+
+/**
  * Bot configuration
  */
 export interface BotConfig {

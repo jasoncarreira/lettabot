@@ -5,9 +5,9 @@
  * Supports DM pairing for secure access control.
  */
 
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, InboundReaction, OutboundMessage } from '../core/types.js';
+import type { HistoryEntry, InboundMessage, InboundReaction, OutboundFile, OutboundMessage } from '../core/types.js';
 import type { DmPolicy } from '../pairing/types.js';
 import {
   isUserAllowed,
@@ -302,11 +302,39 @@ export class TelegramAdapter implements ChannelAdapter {
     });
     return { messageId: String(result.message_id) };
   }
+
+  async sendFile(file: OutboundFile): Promise<{ messageId: string }> {
+    const input = new InputFile(file.filePath);
+    const caption = file.caption ?? '';
+
+    if (file.kind === 'image') {
+      const result = await this.bot.api.sendPhoto(file.chatId, input, { caption });
+      return { messageId: String(result.message_id) };
+    }
+
+    const result = await this.bot.api.sendDocument(file.chatId, input, { caption });
+    return { messageId: String(result.message_id) };
+  }
   
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
     const { markdownToTelegramV2 } = await import('./telegram-format.js');
     const formatted = await markdownToTelegramV2(text);
     await this.bot.api.editMessageText(chatId, Number(messageId), formatted, { parse_mode: 'MarkdownV2' });
+  }
+
+  async addReaction(chatId: string, messageId: string, emoji: string): Promise<void> {
+    const resolved = resolveTelegramEmoji(emoji);
+    if (!TELEGRAM_REACTION_SET.has(resolved)) {
+      throw new Error(`Unsupported Telegram reaction emoji: ${resolved}`);
+    }
+    await this.bot.api.setMessageReaction(chatId, Number(messageId), [
+      { type: 'emoji', emoji: resolved as TelegramReactionEmoji },
+    ]);
+  }
+
+  async fetchHistory(_chatId: string, _options: { limit: number; before?: string }): Promise<HistoryEntry[]> {
+    // Telegram bots cannot fetch arbitrary chat history via Bot API.
+    return [];
   }
   
   async sendTypingIndicator(chatId: string): Promise<void> {
@@ -335,3 +363,43 @@ function extractTelegramReaction(reaction?: {
   }
   return null;
 }
+
+const TELEGRAM_EMOJI_ALIAS_TO_UNICODE: Record<string, string> = {
+  eyes: '👀',
+  thumbsup: '👍',
+  thumbs_up: '👍',
+  '+1': '👍',
+  heart: '❤️',
+  fire: '🔥',
+  smile: '😄',
+  laughing: '😆',
+  tada: '🎉',
+  clap: '👏',
+  ok_hand: '👌',
+};
+
+function resolveTelegramEmoji(input: string): string {
+  const match = input.match(/^:([^:]+):$/);
+  const alias = match ? match[1] : null;
+  if (alias && TELEGRAM_EMOJI_ALIAS_TO_UNICODE[alias]) {
+    return TELEGRAM_EMOJI_ALIAS_TO_UNICODE[alias];
+  }
+  if (TELEGRAM_EMOJI_ALIAS_TO_UNICODE[input]) {
+    return TELEGRAM_EMOJI_ALIAS_TO_UNICODE[input];
+  }
+  return input;
+}
+
+const TELEGRAM_REACTION_EMOJIS = [
+  '👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢',
+  '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳',
+  '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆', '💔', '🤨', '😐', '🍓',
+  '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀', '🎃', '🙈',
+  '😇', '😨', '🤝', '✍', '🤗', '🫡', '🎅', '🎄', '☃', '💅', '🤪', '🗿',
+  '🆒', '💘', '🙉', '🦄', '😘', '💊', '🙊', '😎', '👾', '🤷‍♂', '🤷',
+  '🤷‍♀', '😡',
+] as const;
+
+type TelegramReactionEmoji = typeof TELEGRAM_REACTION_EMOJIS[number];
+
+const TELEGRAM_REACTION_SET = new Set<string>(TELEGRAM_REACTION_EMOJIS);

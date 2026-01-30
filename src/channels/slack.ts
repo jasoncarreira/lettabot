@@ -5,7 +5,9 @@
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, InboundReaction, OutboundMessage } from '../core/types.js';
+import type { HistoryEntry, InboundMessage, InboundReaction, OutboundFile, OutboundMessage } from '../core/types.js';
+import { createReadStream } from 'node:fs';
+import { basename } from 'node:path';
 
 // Dynamic import to avoid requiring Slack deps if not used
 let App: typeof import('@slack/bolt').App;
@@ -44,7 +46,7 @@ export class SlackAdapter implements ChannelAdapter {
     });
     
     // Handle messages
-    this.app.message(async ({ message, say, client }) => {
+    this.app.message(async ({ message, say }) => {
       // Type guard for regular messages
       if (message.subtype !== undefined) return;
       if (!('user' in message) || !('text' in message)) return;
@@ -56,7 +58,7 @@ export class SlackAdapter implements ChannelAdapter {
       
       // Handle audio file attachments
       const files = (message as any).files as Array<{ mimetype?: string; url_private_download?: string; name?: string }> | undefined;
-      const audioFile = files?.find(f => f.mimetype?.startsWith('audio/'));
+      const audioFile = files?.find((file) => file.mimetype?.startsWith('audio/'));
       if (audioFile?.url_private_download) {
         try {
           const { loadConfig } = await import('../config/index.js');
@@ -66,7 +68,7 @@ export class SlackAdapter implements ChannelAdapter {
           } else {
             // Download file (requires bot token for auth)
             const response = await fetch(audioFile.url_private_download, {
-              headers: { 'Authorization': `Bearer ${this.config.botToken}` }
+              headers: { 'Authorization': `Bearer ${this.config.botToken}` },
             });
             const buffer = Buffer.from(await response.arrayBuffer());
             
@@ -178,6 +180,27 @@ export class SlackAdapter implements ChannelAdapter {
     
     return { messageId: result.ts || '' };
   }
+
+  async sendFile(file: OutboundFile): Promise<{ messageId: string }> {
+    if (!this.app) throw new Error('Slack not started');
+
+    const basePayload = {
+      channels: file.chatId,
+      file: createReadStream(file.filePath),
+      filename: basename(file.filePath),
+      initial_comment: file.caption,
+    };
+    const result = file.threadId
+      ? await this.app.client.files.upload({ ...basePayload, thread_ts: file.threadId })
+      : await this.app.client.files.upload(basePayload);
+
+    const shares = (result.file as { shares?: Record<string, Record<string, { ts?: string }[]>> } | undefined)?.shares;
+    const ts = shares?.public?.[file.chatId]?.[0]?.ts
+      || shares?.private?.[file.chatId]?.[0]?.ts
+      || '';
+
+    return { messageId: ts };
+  }
   
   async editMessage(chatId: string, messageId: string, text: string): Promise<void> {
     if (!this.app) throw new Error('Slack not started');
@@ -187,6 +210,38 @@ export class SlackAdapter implements ChannelAdapter {
       ts: messageId,
       text,
     });
+  }
+
+  async addReaction(chatId: string, messageId: string, emoji: string): Promise<void> {
+    if (!this.app) throw new Error('Slack not started');
+    const name = resolveSlackEmojiName(emoji);
+    if (!name) {
+      throw new Error('Unknown emoji alias for Slack');
+    }
+    await this.app.client.reactions.add({
+      channel: chatId,
+      name,
+      timestamp: messageId,
+    });
+  }
+
+  async fetchHistory(chatId: string, options: { limit: number; before?: string }): Promise<HistoryEntry[]> {
+    if (!this.app) throw new Error('Slack not started');
+    const response = await this.app.client.conversations.history({
+      channel: chatId,
+      limit: Math.min(options.limit, 100),
+      ...(options.before ? { latest: options.before, inclusive: false } : {}),
+    });
+    if (!response.ok) {
+      throw new Error(`Slack history error: ${response.error || 'unknown error'}`);
+    }
+    const messages = (response.messages || []) as Array<{ text?: string; ts?: string; user?: string; bot_id?: string }>;
+    return messages.map((message) => ({
+      messageId: message.ts || undefined,
+      author: message.user || message.bot_id || 'unknown',
+      text: message.text || '',
+      timestamp: message.ts ? new Date(Number(message.ts) * 1000).toISOString() : undefined,
+    }));
   }
   
   async sendTypingIndicator(_chatId: string): Promise<void> {
@@ -246,3 +301,32 @@ type SlackReactionEvent = {
   };
   event_ts?: string;
 };
+
+const EMOJI_ALIAS_TO_UNICODE: Record<string, string> = {
+  eyes: '👀',
+  thumbsup: '👍',
+  thumbs_up: '👍',
+  '+1': '👍',
+  heart: '❤️',
+  fire: '🔥',
+  smile: '😄',
+  laughing: '😆',
+  tada: '🎉',
+  clap: '👏',
+  ok_hand: '👌',
+};
+
+const UNICODE_TO_ALIAS = new Map<string, string>(
+  Object.entries(EMOJI_ALIAS_TO_UNICODE).map(([name, value]) => [value, name])
+);
+
+function resolveSlackEmojiName(input: string): string | null {
+  const aliasMatch = input.match(/^:([^:]+):$/);
+  if (aliasMatch) {
+    return aliasMatch[1];
+  }
+  if (EMOJI_ALIAS_TO_UNICODE[input]) {
+    return input;
+  }
+  return UNICODE_TO_ALIAS.get(input) || null;
+}

@@ -1,410 +1,563 @@
 /**
- * WhatsApp Channel Adapter
- * 
- * Uses @whiskeysockets/baileys for WhatsApp Web API.
- * Supports DM pairing for secure access control.
+ * WhatsApp Channel Adapter (Refactored)
+ *
+ * This file orchestrates the WhatsApp adapter using extracted modules.
+ * It handles:
+ * - Adapter lifecycle (start/stop)
+ * - Monitor loop and reconnection logic
+ * - Watchdog for detecting stale connections
+ * - Crypto error handling
+ * - Event delegation to extracted modules
+ *
+ * Extracted responsibilities:
+ * - Socket creation -> session.ts
+ * - Message extraction -> inbound/extract.ts
+ * - Access control -> inbound/access-control.ts
+ * - Message sending -> outbound.ts
+ * - Utilities -> utils.ts
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, OutboundMessage } from '../core/types.js';
-import type { DmPolicy } from '../pairing/types.js';
-import {
-  isUserAllowed,
-  upsertPairingRequest,
-  formatPairingMessage,
-} from '../pairing/store.js';
-import { existsSync, mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
-import qrcode from 'qrcode-terminal';
+import type { InboundMessage, OutboundFile, OutboundMessage } from '../core/types.js';
+import type {
+  WhatsAppConfig,
+  ReconnectState,
+  ListenerRefs,
+  BaileysSocket,
+  BaileysMessage,
+  BaileysDisconnectReasonType,
+  MessagesUpsertData,
+} from './whatsapp/types.js';
+import type { CredsSaveQueue } from '../utils/creds-queue.js';
 
-export interface WhatsAppConfig {
-  sessionPath?: string;  // Where to store auth state
-  dmPolicy?: DmPolicy;   // 'pairing' (default), 'allowlist', or 'open'
-  allowedUsers?: string[]; // Phone numbers (e.g., +15551234567)
-  selfChatMode?: boolean; // Respond to "message yourself" (for personal number use)
-}
+// Session management
+import { createWaSocket, type SocketResult } from './whatsapp/session.js';
+
+// Inbound message handling
+import { extractInboundMessage } from './whatsapp/inbound/extract.js';
+import {
+  checkInboundAccess,
+  formatPairingMessage,
+} from './whatsapp/inbound/access-control.js';
+
+// Outbound message handling
+import {
+  sendWhatsAppMessage,
+  sendWhatsAppFile,
+  sendTypingIndicator,
+  sendReadReceipt,
+  type LidMapper,
+} from './whatsapp/outbound.js';
+
+// Utilities
+import {
+  jidToE164,
+  isSelfChatMessage,
+  createGroupMetaCache,
+  isStatusOrBroadcast,
+  isLid,
+  type GroupMetaCache,
+} from './whatsapp/utils.js';
+
+// Shared utilities
+import {
+  computeBackoff,
+  sleepWithAbort,
+  DEFAULT_RECONNECT_POLICY,
+} from '../utils/backoff.js';
+import { createDedupeCache, type DedupeCache } from '../utils/dedupe-cache.js';
+import { createInboundDebouncer, type Debouncer } from '../utils/debouncer.js';
+import { normalizePhoneForStorage } from '../utils/phone.js';
+
+// Node imports
+import { rmSync } from 'node:fs';
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/** Watchdog check interval (1 minute) */
+const WATCHDOG_INTERVAL_MS = 60 * 1000;
+
+/** Watchdog timeout - force reconnect if no messages received (30 minutes) */
+const WATCHDOG_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** Session corruption threshold - clear session after N failures without QR */
+const SESSION_CORRUPTION_THRESHOLD = 3;
+
+/** Message deduplication TTL (20 minutes) */
+const DEDUPE_TTL_MS = 20 * 60 * 1000;
+
+/** Maximum dedupe cache size */
+const DEDUPE_MAX_SIZE = 5000;
+
+/** Sent message ID cleanup delay (1 minute) */
+const SENT_MESSAGE_CLEANUP_MS = 60 * 1000;
+
+/** Stop timeout (5 seconds) */
+const STOP_TIMEOUT_MS = 5000;
+
+/** Uptime threshold for resetting reconnect attempts (1 minute) */
+const STABLE_CONNECTION_MS = 60 * 1000;
+
+// ============================================================================
+// ADAPTER CLASS
+// ============================================================================
 
 export class WhatsAppAdapter implements ChannelAdapter {
   readonly id = 'whatsapp' as const;
   readonly name = 'WhatsApp';
-  
-  private sock: any = null;
+
   private config: WhatsAppConfig;
   private running = false;
   private sessionPath: string;
-  private myJid: string = '';  // Bot's own JID (for selfChatMode)
-  private myNumber: string = ''; // Bot's phone number
-  private selfChatLid: string = ''; // Self-chat LID (for selfChatMode conversion)
-  private lidToJid: Map<string, string> = new Map(); // Map LID -> real JID for replies
-  private sentMessageIds: Set<string> = new Set(); // Track messages we've sent
-  private processedMessageIds: Set<string> = new Set(); // Dedupe incoming messages
-  
+
+  // Socket state
+  private sock: BaileysSocket | null = null;
+  private DisconnectReason: BaileysDisconnectReasonType | null = null;
+  private myJid: string = '';
+  private myNumber: string = '';
+
+  // LID mapping for message sending
+  private selfChatLid: string = '';
+  private lidToJid: Map<string, string> = new Map();
+
+  // Message tracking
+  private sentMessageIds: Set<string> = new Set();
+  private dedupeCache: DedupeCache;
+  private debouncer: Debouncer<InboundMessage>;
+
+  // Group metadata cache
+  private groupMetaCache: GroupMetaCache;
+
+  // Message store for getMessage callback (populated when we SEND, not receive)
+  private messageStore: Map<string, any> = new Map();
+
+  // Attachment configuration
+  private attachmentsDir?: string;
+  private attachmentsMaxBytes?: number;
+  private downloadContentFromMessage?: (message: any, type: string) => Promise<AsyncIterable<Uint8Array>>;
+
+  // Reconnect state
+  private reconnectState: ReconnectState = {
+    attempts: 0,
+    lastDisconnect: null,
+    abortController: null,
+    monitorTask: null,
+  };
+
+  // Watchdog timer for detecting stale connections
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private lastMessageTime: Date | null = null;
+
+  // Connection timestamp (for filtering old messages on reconnect)
+  private connectedAtMs: number = 0;
+
+  // Event listener references
+  private listenerRefs: ListenerRefs = {};
+
+  // Crypto error handler
+  private cryptoErrorHandler: ((reason: any) => void) | null = null;
+
+  // Disconnect signal for monitor loop
+  private disconnectSignal: (() => void) | null = null;
+
+  // Consecutive failures without QR (session corruption indicator)
+  private consecutiveNoQrFailures = 0;
+
+  // Credential save queue
+  private credsSaveQueue: CredsSaveQueue | null = null;
+
+  // Event handler (set by bot core)
   onMessage?: (msg: InboundMessage) => Promise<void>;
-  
+
+  // Pre-bound handlers (created once to avoid bind() overhead)
+  private boundHandleConnectionUpdate: (update: Partial<import('@whiskeysockets/baileys').ConnectionState>) => void;
+  private boundHandleMessagesUpsert: (data: MessagesUpsertData) => void;
+
   constructor(config: WhatsAppConfig) {
     this.config = {
       ...config,
-      dmPolicy: config.dmPolicy || 'pairing',  // Default to pairing
+      dmPolicy: config.dmPolicy || 'pairing',
     };
-    this.sessionPath = resolve(config.sessionPath || './data/whatsapp-session');
-  }
-  
-  /**
-   * Check if a user is authorized based on dmPolicy
-   * Returns 'allowed', 'blocked', or 'pairing'
-   */
-  private async checkAccess(userId: string, userName?: string): Promise<'allowed' | 'blocked' | 'pairing'> {
-    const policy = this.config.dmPolicy || 'pairing';
-    const phone = userId.startsWith('+') ? userId : `+${userId}`;
-    
-    // Open policy: everyone allowed
-    if (policy === 'open') {
-      return 'allowed';
-    }
-    
-    // Self-chat mode: always allow self
-    if (this.config.selfChatMode && userId === this.myNumber) {
-      return 'allowed';
-    }
-    
-    // Check if already allowed (config or store)
-    const allowed = await isUserAllowed('whatsapp', phone, this.config.allowedUsers);
-    if (allowed) {
-      return 'allowed';
-    }
-    
-    // Allowlist policy: not allowed if not in list
-    if (policy === 'allowlist') {
-      return 'blocked';
-    }
-    
-    // Pairing policy: needs pairing
-    return 'pairing';
-  }
-  
-  /**
-   * Format pairing message for WhatsApp
-   */
-  private formatPairingMsg(code: string): string {
-    return `Hi! This bot requires pairing.
+    this.sessionPath = config.sessionPath || './data/whatsapp-session';
 
-Your pairing code: *${code}*
+    // Initialize dedupe cache
+    this.dedupeCache = createDedupeCache({
+      ttlMs: DEDUPE_TTL_MS,
+      maxSize: DEDUPE_MAX_SIZE,
+    });
 
-Ask the bot owner to approve with:
-\`lettabot pairing approve whatsapp ${code}\``;
+    // Initialize group metadata cache
+    this.groupMetaCache = createGroupMetaCache();
+
+    // Initialize attachment configuration
+    this.attachmentsDir = config.attachmentsDir;
+    this.attachmentsMaxBytes = config.attachmentsMaxBytes;
+
+    // Initialize message debouncer (batches rapid consecutive messages)
+    this.debouncer = createInboundDebouncer({
+      debounceMs: 2000, // 2 second window
+      onFlush: async (messages) => {
+        for (const message of messages) {
+          await this.onMessage?.(message);
+        }
+      },
+    });
+
+    // Bind handlers once
+    this.boundHandleConnectionUpdate = (update) => this.handleConnectionUpdate(update);
+    this.boundHandleMessagesUpsert = (data) => this.handleMessagesUpsert(data);
   }
-  
+
   async start(): Promise<void> {
     if (this.running) return;
-    
-    // Suppress noisy Baileys console output (session crypto details, errors)
-    const originalLog = console.log;
-    const originalError = console.error;
-    const suppressPatterns = [
-      'Closing session',
-      'SessionEntry',
-      'Session error',
-      'Bad MAC',
-      'Failed to decrypt',
-      'Closing open session',
-      'prekey bundle',
-    ];
-    const shouldSuppress = (msg: string) => suppressPatterns.some(p => msg.includes(p));
-    
-    console.log = (...args: any[]) => {
-      const msg = args[0]?.toString?.() || '';
-      if (shouldSuppress(msg)) return;
-      originalLog.apply(console, args);
-    };
-    console.error = (...args: any[]) => {
-      const msg = args[0]?.toString?.() || '';
-      if (shouldSuppress(msg)) return;
-      originalError.apply(console, args);
-    };
-    
-    // Check for competing WhatsApp bots
-    try {
-      const { execSync } = await import('node:child_process');
-      const procs = execSync('ps aux | grep -i "clawdbot\\|moltbot" | grep -v grep', { encoding: 'utf-8' });
-      if (procs.trim()) {
-        console.warn('[WhatsApp] ⚠️  Warning: clawdbot/moltbot is running and may compete for WhatsApp connection.');
-        console.warn('[WhatsApp] Stop it with: launchctl unload ~/Library/LaunchAgents/com.clawdbot.gateway.plist');
-      }
-    } catch {} // No competing bots found
-    
-    // Ensure session directory exists
-    mkdirSync(this.sessionPath, { recursive: true });
-    
-    // Dynamic import
-    const { 
-      default: makeWASocket, 
-      useMultiFileAuthState, 
-      DisconnectReason,
-      fetchLatestBaileysVersion,
-      makeCacheableSignalKeyStore,
-      downloadMediaMessage,
-    } = await import('@whiskeysockets/baileys');
-    
-    // Load auth state
-    const { state, saveCreds } = await useMultiFileAuthState(this.sessionPath);
-    
-    // Get latest WA Web version
-    const { version } = await fetchLatestBaileysVersion();
-    console.log('[WhatsApp] Using WA Web version:', version.join('.'));
-    
-    // Silent logger to suppress noisy baileys logs
-    const silentLogger = {
-      level: 'silent',
-      trace: () => {},
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: () => {},
-      fatal: () => {},
-      child: () => silentLogger,
-    };
-    
-    // Create socket with proper config (matching moltbot)
-    this.sock = makeWASocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, silentLogger as any),
-      },
-      version,
-      browser: ['LettaBot', 'Desktop', '1.0.0'],
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
-      logger: silentLogger as any,
-    });
-    
-    // Save credentials when updated
-    this.sock.ev.on('creds.update', saveCreds);
-    
-    // Handle connection updates
-    this.sock.ev.on('connection.update', (update: any) => {
-      const { connection, lastDisconnect, qr } = update;
-      
-      if (qr) {
-        console.log('[WhatsApp] Scan this QR code in WhatsApp → Linked Devices:');
-        qrcode.generate(qr, { small: true });
-      }
-      
-      if (connection === 'close') {
-        const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
-        console.log('[WhatsApp] Connection closed, reconnecting:', shouldReconnect);
-        
-        if (shouldReconnect) {
-          this.start();  // Reconnect
-        } else {
-          this.running = false;
-        }
-      } else if (connection === 'open') {
-        // Capture our own JID for selfChatMode
-        this.myJid = this.sock.user?.id || '';
-        this.myNumber = this.myJid.replace(/@.*/, '').replace(/:\d+/, '');
-        console.log(`[WhatsApp] Connected as ${this.myNumber}`);
-        this.running = true;
-      }
-    });
-    
-    // Handle incoming messages
-    this.sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
-      
-      for (const m of messages) {
-        const messageId = m.key.id || '';
-        
-        // Skip messages we sent (prevents loop in selfChatMode)
-        if (this.sentMessageIds.has(messageId)) {
-          this.sentMessageIds.delete(messageId); // Clean up
-          continue;
-        }
-        
-        // Skip duplicate messages (WhatsApp retry mechanism)
-        if (this.processedMessageIds.has(messageId)) {
-          continue;
-        }
-        this.processedMessageIds.add(messageId);
-        setTimeout(() => this.processedMessageIds.delete(messageId), 60000);
-        
-        const remoteJid = m.key.remoteJid || '';
-        
-        // Detect self-chat: message from ourselves to ourselves
-        const senderPn = (m.key as any).senderPn as string | undefined;
-        const isSelfChat = m.key.fromMe && (
-          remoteJid === this.myJid || 
-          remoteJid.replace(/@.*/, '') === this.myNumber ||
-          // In selfChatMode, fromMe + LID = self-chat (don't require !senderPn as it can vary)
-          (this.config.selfChatMode && remoteJid.includes('@lid'))
-        );
-        
-        // Track self-chat LID for reply conversion
-        if (isSelfChat && remoteJid.includes('@lid')) {
-          this.selfChatLid = remoteJid;
-        }
-        
-        // Skip own messages (unless selfChatMode enabled for self-chat)
-        if (m.key.fromMe) {
-          if (!(this.config.selfChatMode && isSelfChat)) {
-            continue;
-          }
-        }
-        
-        // Capture LID → real JID mapping from senderPn (for replying to LID contacts)
-        if (remoteJid.includes('@lid') && (m.key as any).senderPn) {
-          this.lidToJid.set(remoteJid, (m.key as any).senderPn);
-        }
-        
-        // Get message text or audio
-        let text = m.message?.conversation || 
-                   m.message?.extendedTextMessage?.text ||
-                   '';
-        
-        // Handle audio/voice messages
-        const audioMessage = m.message?.audioMessage;
-        if (audioMessage) {
-          try {
-            const { loadConfig } = await import('../config/index.js');
-            const config = loadConfig();
-            if (!config.transcription?.apiKey && !process.env.OPENAI_API_KEY) {
-              await this.sock!.sendMessage(remoteJid, { 
-                text: 'Voice messages require OpenAI API key for transcription. See: https://github.com/letta-ai/lettabot#voice-messages' 
-              });
-              continue;
-            }
-            
-            // Download audio
-            const buffer = await downloadMediaMessage(m, 'buffer', {});
-            
-            // Transcribe
-            const { transcribeAudio } = await import('../transcription/index.js');
-            const transcript = await transcribeAudio(buffer as Buffer, 'voice.ogg');
-            
-            console.log(`[WhatsApp] Transcribed voice message: "${transcript.slice(0, 50)}..."`);
-            text = `[Voice message]: ${transcript}`;
-          } catch (error) {
-            console.error('[WhatsApp] Error transcribing voice message:', error);
-            continue;
-          }
-        }
-        
-        if (!text) continue;
-        
-        const userId = remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
-        const isGroup = remoteJid.endsWith('@g.us');
-        const pushName = m.pushName;
-        
-        // Check access control (for DMs only, groups are open, self-chat always allowed)
-        if (!isGroup && !isSelfChat) {
-          // CRITICAL: If selfChatMode is enabled, ONLY respond to self-chat messages
-          // Silently ignore all non-self messages to prevent bot from messaging other people
-          if (this.config.selfChatMode) {
-            continue;
-          }
-          
-          const access = await this.checkAccess(userId, pushName);
-          
-          if (access === 'blocked') {
-            await this.sock.sendMessage(remoteJid, { text: "Sorry, you're not authorized to use this bot." });
-            continue;
-          }
-          
-          if (access === 'pairing') {
-            // Create pairing request
-            const result = await upsertPairingRequest('whatsapp', userId, pushName);
-            
-            if (!result) {
-              await this.sock.sendMessage(remoteJid, { 
-                text: "Too many pending pairing requests. Please try again later." 
-              });
-              continue;
-            }
-            
-            const { code, created } = result;
-            
-            // Send pairing message on first contact
-            if (created) {
-              console.log(`[WhatsApp] New pairing request from ${userId}: ${code}`);
-              await this.sock.sendMessage(remoteJid, { text: this.formatPairingMsg(code) });
-            }
-            continue;
-          }
-        }
-        
-        if (this.onMessage) {
-          await this.onMessage({
-            channel: 'whatsapp',
-            chatId: remoteJid,
-            userId,
-            userName: pushName || undefined,
-            messageId: m.key?.id || undefined,
-            text,
-            timestamp: new Date(m.messageTimestamp * 1000),
-            isGroup,
-            // Group name would require additional API call to get chat metadata
-            // For now, we don't have it readily available from the message
-          });
-        }
-      }
-    });
+
+    await this.connect();
   }
-  
+
   async stop(): Promise<void> {
-    if (!this.running || !this.sock) return;
-    await this.sock.logout();
+    if (!this.running) return;
+
     this.running = false;
+    this.stopWatchdog();
+    await this.cleanupListeners();
+    this.disconnectSignal?.();
+
+    if (this.sock) {
+      await this.sock.logout();
+      this.sock = null;
+    }
   }
-  
+
   isRunning(): boolean {
     return this.running;
   }
-  
+
   async sendMessage(msg: OutboundMessage): Promise<{ messageId: string }> {
     if (!this.sock) throw new Error('WhatsApp not connected');
-    
-    // Convert LID to proper JID for sending
-    let targetJid = msg.chatId;
-    if (targetJid.includes('@lid')) {
-      if (targetJid === this.selfChatLid && this.myNumber) {
-        // Self-chat LID -> our own number
-        targetJid = `${this.myNumber}@s.whatsapp.net`;
-      } else if (this.lidToJid.has(targetJid)) {
-        // Friend LID -> their real JID from senderPn
-        targetJid = this.lidToJid.get(targetJid)!;
-      } else {
-        // FAIL SAFE: Don't send to unknown LID - could go to wrong person
-        console.error(`[WhatsApp] Cannot send to unknown LID: ${targetJid}`);
-        throw new Error(`Cannot send to unknown LID - no mapping found`);
-      }
-    }
-    
-    try {
-      const result = await this.sock.sendMessage(targetJid, { text: msg.text });
-      const messageId = result?.key?.id || '';
-      
-      // Track sent message to avoid processing it as incoming (selfChatMode loop prevention)
-      if (messageId) {
-        this.sentMessageIds.add(messageId);
-        // Clean up old IDs after 60 seconds
-        setTimeout(() => this.sentMessageIds.delete(messageId), 60000);
-      }
-      
-      return { messageId };
-    } catch (error) {
-      console.error(`[WhatsApp] sendMessage error:`, error);
-      throw error;
-    }
+
+    // Build LID mapper
+    const lidMapper: LidMapper = {
+      selfChatLid: this.selfChatLid,
+      myNumber: this.myNumber,
+      lidToJid: this.lidToJid,
+      messageStore: this.messageStore, // Pass store for saving sent messages
+    };
+
+    // Delegate to extracted module
+    return await sendWhatsAppMessage(
+      this.sock,
+      msg,
+      lidMapper,
+      this.sentMessageIds
+    );
   }
-  
+
   supportsEditing(): boolean {
     return false;
   }
-  
-  async editMessage(_chatId: string, _messageId: string, _text: string): Promise<void> {
+
+  async editMessage(
+    _chatId: string,
+    _messageId: string,
+    _text: string
+  ): Promise<void> {
     // WhatsApp doesn't support editing messages - no-op
   }
-  
+
+  async addReaction(_chatId: string, _messageId: string, _emoji: string): Promise<void> {
+    // WhatsApp reactions via Baileys are not supported here yet
+  }
+
+  async sendFile(file: OutboundFile): Promise<{ messageId: string }> {
+    if (!this.sock) {
+      throw new Error('WhatsApp not connected');
+    }
+
+    const lidMapper: LidMapper = {
+      selfChatLid: this.selfChatLid,
+      myNumber: this.myNumber,
+      lidToJid: this.lidToJid,
+      messageStore: this.messageStore,
+    };
+
+    return await sendWhatsAppFile(this.sock, file, lidMapper, this.sentMessageIds);
+  }
+
   async sendTypingIndicator(chatId: string): Promise<void> {
     if (!this.sock) return;
-    await this.sock.sendPresenceUpdate('composing', chatId);
+    await sendTypingIndicator(this.sock, chatId);
+  }
+
+  private async connect(): Promise<void> {
+    this.running = true;
+
+    const socketResult = await createWaSocket({
+      config: this.config,
+      sessionPath: this.sessionPath,
+      onConnectionUpdate: this.boundHandleConnectionUpdate,
+      onMessagesUpsert: this.boundHandleMessagesUpsert,
+      onCredsSaveQueue: (queue) => {
+        this.credsSaveQueue = queue;
+      },
+    });
+
+    this.sock = socketResult.socket;
+    this.DisconnectReason = socketResult.DisconnectReason;
+    this.downloadContentFromMessage = socketResult.downloadContentFromMessage;
+
+    this.attachListeners();
+    this.startWatchdog();
+  }
+
+  private async handleConnectionUpdate(update: Partial<import('@whiskeysockets/baileys').ConnectionState>): Promise<void> {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === 'open') {
+      this.onConnectionOpen();
+      return;
+    }
+
+    if (connection === 'close') {
+      await this.onConnectionClose(lastDisconnect);
+    }
+  }
+
+  private onConnectionOpen(): void {
+    if (!this.sock) return;
+
+    this.running = true;
+    this.connectedAtMs = Date.now();
+    this.resetReconnectState();
+    this.lastMessageTime = new Date();
+
+    this.myJid = this.sock.user?.id || '';
+    this.myNumber = jidToE164(this.myJid);
+
+    if (this.sock.user?.lid) {
+      this.selfChatLid = this.sock.user.lid;
+      this.lidToJid.set(this.selfChatLid, this.myJid);
+    }
+
+    console.log(`[WhatsApp] Connected as ${this.myNumber || this.myJid}`);
+  }
+
+  private async onConnectionClose(lastDisconnect: any): Promise<void> {
+    const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+
+    if (!this.DisconnectReason) return;
+
+    if (statusCode === this.DisconnectReason.loggedOut) {
+      console.warn('[WhatsApp] Logged out. Clearing session.');
+      this.cleanupSession();
+      return;
+    }
+
+    await this.scheduleReconnect(lastDisconnect);
+  }
+
+  private async handleMessagesUpsert(data: MessagesUpsertData): Promise<void> {
+    const { messages, type } = data;
+    if (type !== 'notify') return;
+    if (!this.sock) return;
+
+    for (const message of messages) {
+      if (!message.message) continue;
+
+      // Drop broadcast/status messages
+      if (isStatusOrBroadcast(message)) {
+        continue;
+      }
+
+      // Skip messages we sent (prevents loop in selfChatMode)
+      const messageId = message.key?.id || '';
+      if (messageId && this.sentMessageIds.has(messageId)) {
+        this.sentMessageIds.delete(messageId);
+        continue;
+      }
+
+      // Ignore old messages from before we reconnected
+      const messageTimestamp = Number(message.messageTimestamp || 0) * 1000;
+      if (this.connectedAtMs && messageTimestamp < this.connectedAtMs - 1000) {
+        continue;
+      }
+
+      const sender = message.key?.participant || message.key?.remoteJid || '';
+      if (!sender) continue;
+
+      // Update watchdog timestamp
+      this.lastMessageTime = new Date();
+
+      // Dedupe incoming messages
+      if (this.dedupeCache.has(messageId)) {
+        continue;
+      }
+      if (messageId) {
+        this.dedupeCache.add(messageId);
+      }
+
+      // Update LID mapping when available
+      if (isLid(sender) && message.key?.remoteJid) {
+        this.lidToJid.set(sender, message.key.remoteJid);
+      }
+
+      // Skip self messages if not in self-chat mode
+      if (!this.config.selfChatMode && isSelfChatMessage(message, this.myJid)) {
+        continue;
+      }
+
+      const accessResult = await checkInboundAccess(
+        this.config,
+        sender,
+        message,
+        this.sock,
+        this.credsSaveQueue,
+        this.myNumber
+      );
+
+      if (accessResult.status === 'blocked') {
+        continue;
+      }
+
+      if (accessResult.status === 'pairing') {
+        const pairingMessage = formatPairingMessage(accessResult.code);
+        if (accessResult.replyJid && pairingMessage) {
+          await this.sock.sendMessage(accessResult.replyJid, { text: pairingMessage });
+        }
+        continue;
+      }
+
+      const inbound = await extractInboundMessage({
+        message,
+        sock: this.sock,
+        config: this.config,
+        groupMetaCache: this.groupMetaCache,
+        downloadContentFromMessage: this.downloadContentFromMessage,
+        attachmentsDir: this.attachmentsDir,
+        attachmentsMaxBytes: this.attachmentsMaxBytes,
+      });
+
+      if (!inbound) {
+        continue;
+      }
+
+      // Normalize chat and user IDs
+      inbound.chatId = normalizePhoneForStorage(inbound.chatId);
+      inbound.userId = normalizePhoneForStorage(inbound.userId);
+
+      // Mark as read
+      try {
+        await sendReadReceipt(this.sock, message);
+      } catch (err) {
+        console.warn('[WhatsApp] Failed to send read receipt:', err);
+      }
+
+      await this.debouncer.add(inbound);
+    }
+  }
+
+  private attachListeners(): void {
+    if (!this.sock) return;
+
+    const socket = this.sock;
+
+    this.listenerRefs.connectionUpdate = this.boundHandleConnectionUpdate;
+    this.listenerRefs.messagesUpsert = this.boundHandleMessagesUpsert;
+
+    socket.ev.on('connection.update', this.boundHandleConnectionUpdate);
+    socket.ev.on('messages.upsert', this.boundHandleMessagesUpsert);
+  }
+
+  private async cleanupListeners(): Promise<void> {
+    if (!this.sock) return;
+
+    const socket = this.sock;
+
+    if (this.listenerRefs.connectionUpdate) {
+      socket.ev.off('connection.update', this.listenerRefs.connectionUpdate);
+      this.listenerRefs.connectionUpdate = undefined;
+    }
+
+    if (this.listenerRefs.messagesUpsert) {
+      socket.ev.off('messages.upsert', this.listenerRefs.messagesUpsert);
+      this.listenerRefs.messagesUpsert = undefined;
+    }
+  }
+
+  private startWatchdog(): void {
+    this.stopWatchdog();
+    this.watchdogTimer = setInterval(() => {
+      if (!this.lastMessageTime || !this.sock) return;
+      const elapsedMs = Date.now() - this.lastMessageTime.getTime();
+      if (elapsedMs > WATCHDOG_TIMEOUT_MS) {
+        console.warn('[WhatsApp] Watchdog timeout, forcing reconnect');
+        this.sock?.end(new Error('Watchdog timeout'));
+      }
+    }, WATCHDOG_INTERVAL_MS);
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private async scheduleReconnect(lastDisconnect: any): Promise<void> {
+    if (!this.running) return;
+
+    this.reconnectState.attempts += 1;
+    this.reconnectState.lastDisconnect = lastDisconnect;
+
+    if (this.reconnectState.attempts >= SESSION_CORRUPTION_THRESHOLD) {
+      console.warn('[WhatsApp] Too many failed reconnects, clearing session.');
+      this.cleanupSession();
+      return;
+    }
+
+    const policy = this.config.reconnectPolicy || DEFAULT_RECONNECT_POLICY;
+    const delayMs = computeBackoff(this.reconnectState.attempts, policy);
+
+    console.log(`[WhatsApp] Scheduling reconnect in ${Math.round(delayMs / 1000)}s`);
+
+    this.disconnectSignal?.();
+    const abortController = new AbortController();
+    this.reconnectState.abortController = abortController;
+
+    const monitorTask = (async () => {
+      try {
+        await sleepWithAbort(delayMs, abortController.signal);
+        if (!this.running) return;
+        await this.connect();
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          console.warn('[WhatsApp] Reconnect sleep aborted:', err);
+        }
+      }
+    })();
+
+    this.reconnectState.monitorTask = monitorTask;
+  }
+
+  private resetReconnectState(): void {
+    this.reconnectState.attempts = 0;
+    this.reconnectState.lastDisconnect = null;
+    this.reconnectState.abortController?.abort();
+    this.reconnectState.abortController = null;
+    this.reconnectState.monitorTask = null;
+    this.consecutiveNoQrFailures = 0;
+  }
+
+  private cleanupSession(): void {
+    try {
+      rmSync(this.sessionPath, { recursive: true, force: true });
+    } catch (err) {
+      console.warn('[WhatsApp] Failed to remove session folder:', err);
+    }
+    this.sock?.end(new Error('Session cleared'));
+    this.sock = null;
   }
 }
+
+export type { WhatsAppConfig };
