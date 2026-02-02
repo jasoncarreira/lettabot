@@ -44,6 +44,26 @@ export interface LettaBotConfig {
       intervalMin?: number;
     };
   };
+
+  // Integrations (Google Workspace, etc.)
+  integrations?: {
+    google?: GoogleConfig;
+  };
+
+  // Transcription (voice messages)
+  transcription?: TranscriptionConfig;
+
+  // Attachment handling
+  attachments?: {
+    maxMB?: number;
+    maxAgeDays?: number;
+  };
+}
+
+export interface TranscriptionConfig {
+  provider: 'openai';  // Only OpenAI supported currently
+  apiKey?: string;     // Falls back to OPENAI_API_KEY env var
+  model?: string;      // Defaults to 'whisper-1'
 }
 
 export interface ProviderConfig {
@@ -77,6 +97,7 @@ export interface WhatsAppConfig {
 export interface SignalConfig {
   enabled: boolean;
   phone?: string;
+  selfChat?: boolean;
   dmPolicy?: 'pairing' | 'allowlist' | 'open';
   allowedUsers?: string[];
 }
@@ -86,6 +107,12 @@ export interface DiscordConfig {
   token?: string;
   dmPolicy?: 'pairing' | 'allowlist' | 'open';
   allowedUsers?: string[];
+}
+
+export interface GoogleConfig {
+  enabled: boolean;
+  account?: string;
+  services?: string[];  // e.g., ['gmail', 'calendar', 'drive', 'contacts', 'docs', 'sheets']
 }
 
 // Default config

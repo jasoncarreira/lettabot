@@ -8,6 +8,121 @@ import { spawnSync } from 'node:child_process';
 import * as p from '@clack/prompts';
 import { saveConfig, syncProviders } from './config/index.js';
 import type { LettaBotConfig, ProviderConfig } from './config/types.js';
+import { isLettaCloudUrl } from './utils/server.js';
+
+// ============================================================================
+// Non-Interactive Helpers
+// ============================================================================
+
+function readConfigFromEnv(existingConfig: any): any {
+  return {
+    baseUrl: process.env.LETTA_BASE_URL || existingConfig.server?.baseUrl || 'https://api.letta.com',
+    apiKey: process.env.LETTA_API_KEY || existingConfig.server?.apiKey,
+    agentId: process.env.LETTA_AGENT_ID || existingConfig.agent?.id,
+    agentName: process.env.LETTA_AGENT_NAME || existingConfig.agent?.name || 'lettabot',
+    model: process.env.LETTA_MODEL || existingConfig.agent?.model || 'claude-sonnet-4',
+    
+    telegram: {
+      enabled: !!process.env.TELEGRAM_BOT_TOKEN,
+      botToken: process.env.TELEGRAM_BOT_TOKEN || existingConfig.channels?.telegram?.token,
+      dmPolicy: process.env.TELEGRAM_DM_POLICY || existingConfig.channels?.telegram?.dmPolicy || 'pairing',
+      allowedUsers: process.env.TELEGRAM_ALLOWED_USERS?.split(',').map(s => s.trim()) || existingConfig.channels?.telegram?.allowedUsers,
+    },
+    
+    slack: {
+      enabled: !!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN),
+      botToken: process.env.SLACK_BOT_TOKEN || existingConfig.channels?.slack?.botToken,
+      appToken: process.env.SLACK_APP_TOKEN || existingConfig.channels?.slack?.appToken,
+      dmPolicy: process.env.SLACK_DM_POLICY || existingConfig.channels?.slack?.dmPolicy || 'pairing',
+      allowedUsers: process.env.SLACK_ALLOWED_USERS?.split(',').map(s => s.trim()) || existingConfig.channels?.slack?.allowedUsers,
+    },
+    
+    discord: {
+      enabled: !!process.env.DISCORD_BOT_TOKEN,
+      botToken: process.env.DISCORD_BOT_TOKEN || existingConfig.channels?.discord?.token,
+      dmPolicy: process.env.DISCORD_DM_POLICY || existingConfig.channels?.discord?.dmPolicy || 'pairing',
+      allowedUsers: process.env.DISCORD_ALLOWED_USERS?.split(',').map(s => s.trim()) || existingConfig.channels?.discord?.allowedUsers,
+    },
+    
+    whatsapp: {
+      enabled: process.env.WHATSAPP_ENABLED === 'true' || !!existingConfig.channels?.whatsapp?.enabled,
+      selfChat: process.env.WHATSAPP_SELF_CHAT_MODE !== 'false' && (existingConfig.channels?.whatsapp?.selfChat !== false),
+      dmPolicy: process.env.WHATSAPP_DM_POLICY || existingConfig.channels?.whatsapp?.dmPolicy || 'pairing',
+      allowedUsers: process.env.WHATSAPP_ALLOWED_USERS?.split(',').map(s => s.trim()) || existingConfig.channels?.whatsapp?.allowedUsers,
+    },
+    
+    signal: {
+      enabled: !!process.env.SIGNAL_PHONE_NUMBER,
+      phoneNumber: process.env.SIGNAL_PHONE_NUMBER || existingConfig.channels?.signal?.phoneNumber,
+      selfChat: process.env.SIGNAL_SELF_CHAT_MODE !== 'false' && (existingConfig.channels?.signal?.selfChat !== false),
+      dmPolicy: process.env.SIGNAL_DM_POLICY || existingConfig.channels?.signal?.dmPolicy || 'pairing',
+      allowedUsers: process.env.SIGNAL_ALLOWED_USERS?.split(',').map(s => s.trim()) || existingConfig.channels?.signal?.allowedUsers,
+    },
+  };
+}
+
+async function saveConfigFromEnv(config: any, configPath: string): Promise<void> {
+  const { saveConfig } = await import('./config/index.js');
+  
+  const lettabotConfig: LettaBotConfig = {
+    server: {
+      mode: isLettaCloudUrl(config.baseUrl) ? 'cloud' : 'selfhosted',
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+    },
+    agent: {
+      id: config.agentId,
+      name: config.agentName,
+      model: config.model,
+    },
+    channels: {
+      telegram: config.telegram.enabled ? {
+        enabled: true,
+        token: config.telegram.botToken,
+        dmPolicy: config.telegram.dmPolicy,
+        allowedUsers: config.telegram.allowedUsers,
+      } : { enabled: false },
+      
+      slack: config.slack.enabled ? {
+        enabled: true,
+        botToken: config.slack.botToken,
+        appToken: config.slack.appToken,
+        allowedUsers: config.slack.allowedUsers,
+      } : { enabled: false },
+      
+      discord: config.discord.enabled ? {
+        enabled: true,
+        token: config.discord.botToken,
+        dmPolicy: config.discord.dmPolicy,
+        allowedUsers: config.discord.allowedUsers,
+      } : { enabled: false },
+      
+      whatsapp: config.whatsapp.enabled ? {
+        enabled: true,
+        selfChat: config.whatsapp.selfChat,
+        dmPolicy: config.whatsapp.dmPolicy,
+        allowedUsers: config.whatsapp.allowedUsers,
+      } : { enabled: false },
+      
+      signal: config.signal.enabled ? {
+        enabled: true,
+        phone: config.signal.phoneNumber,
+        selfChat: config.signal.selfChat,
+        dmPolicy: config.signal.dmPolicy,
+        allowedUsers: config.signal.allowedUsers,
+      } : { enabled: false },
+    },
+    features: {
+      cron: false,
+      heartbeat: {
+        enabled: false,
+        intervalMin: 60,
+      },
+    },
+  };
+  
+  saveConfig(lettabotConfig);
+}
 
 // ============================================================================
 // Config Types
@@ -35,9 +150,11 @@ interface OnboardConfig {
   telegram: { enabled: boolean; token?: string; dmPolicy?: 'pairing' | 'allowlist' | 'open'; allowedUsers?: string[] };
   slack: { enabled: boolean; appToken?: string; botToken?: string; allowedUsers?: string[] };
   whatsapp: { enabled: boolean; selfChat?: boolean; dmPolicy?: 'pairing' | 'allowlist' | 'open'; allowedUsers?: string[] };
-  signal: { enabled: boolean; phone?: string; dmPolicy?: 'pairing' | 'allowlist' | 'open'; allowedUsers?: string[] };
+  signal: { enabled: boolean; phone?: string; selfChat?: boolean; dmPolicy?: 'pairing' | 'allowlist' | 'open'; allowedUsers?: string[] };
   discord: { enabled: boolean; token?: string; dmPolicy?: 'pairing' | 'allowlist' | 'open'; allowedUsers?: string[] };
-  gmail: { enabled: boolean; account?: string };
+  
+  // Google Workspace (via gog CLI)
+  google: { enabled: boolean; account?: string; services?: string[] };
   
   // Features
   heartbeat: { enabled: boolean; interval?: string };
@@ -51,11 +168,11 @@ const isPlaceholder = (val?: string) => !val || /^(your_|sk-\.\.\.|placeholder|e
 // ============================================================================
 
 async function stepAuth(config: OnboardConfig, env: Record<string, string>): Promise<void> {
-  const { requestDeviceCode, pollForToken, LETTA_CLOUD_API_URL } = await import('./auth/oauth.js');
+  const { requestDeviceCode, pollForToken } = await import('./auth/oauth.js');
   const { saveTokens, loadTokens, getOrCreateDeviceId, getDeviceName } = await import('./auth/tokens.js');
   
   const baseUrl = config.baseUrl || env.LETTA_BASE_URL || process.env.LETTA_BASE_URL;
-  const isLettaCloud = !baseUrl || baseUrl === LETTA_CLOUD_API_URL || baseUrl === 'https://api.letta.com';
+  const isLettaCloud = isLettaCloudUrl(baseUrl);
   
   const existingTokens = loadTokens();
   // Check both env and config for existing API key
@@ -481,13 +598,21 @@ async function stepChannels(config: OnboardConfig, env: Record<string, string>):
     },
   ];
   
-  // Don't pre-select any channels - let user explicitly choose
+  // Pre-select channels that are already enabled (preserves existing config)
+  const initialChannels: string[] = [];
+  if (config.telegram.enabled) initialChannels.push('telegram');
+  if (config.slack.enabled) initialChannels.push('slack');
+  if (config.discord.enabled) initialChannels.push('discord');
+  if (config.whatsapp.enabled) initialChannels.push('whatsapp');
+  if (config.signal.enabled) initialChannels.push('signal');
+  
   let channels: string[] = [];
   
   while (true) {
     const selectedChannels = await p.multiselect({
       message: 'Select channels (space to toggle, enter to confirm)',
       options: channelOptions,
+      initialValues: initialChannels,
       required: false,
     });
     if (p.isCancel(selectedChannels)) { p.cancel('Setup cancelled'); process.exit(0); }
@@ -656,18 +781,39 @@ async function stepChannels(config: OnboardConfig, env: Record<string, string>):
 
   if (config.discord.enabled) {
     p.note(
-      'Create a bot at discord.com/developers/applications.\n' +
-      'Enable "Message Content Intent" for reading messages.\n' +
-      'Invite the bot to your server with Send Messages permission.',
+      '1. Go to discord.com/developers/applications\n' +
+      '2. Click "New Application" (or select existing)\n' +
+      '3. Go to "Bot" → Copy the Bot Token\n' +
+      '4. Enable "Message Content Intent" (under Privileged Gateway Intents)\n' +
+      '5. Go to "OAuth2" → "URL Generator"\n' +
+      '   • Scopes: bot\n' +
+      '   • Permissions: Send Messages, Read Message History, View Channels\n' +
+      '6. Copy the generated URL and open it to invite the bot to your server',
       'Discord Setup'
     );
 
     const token = await p.text({
       message: 'Discord Bot Token',
-      placeholder: 'Bot token',
+      placeholder: 'Bot → Reset Token → Copy',
       initialValue: config.discord.token || '',
     });
-    if (!p.isCancel(token) && token) config.discord.token = token;
+    if (!p.isCancel(token) && token) {
+      config.discord.token = token;
+      
+      // Extract application ID from token and show invite URL
+      // Token format: base64(app_id).timestamp.hmac
+      try {
+        const appId = Buffer.from(token.split('.')[0], 'base64').toString();
+        if (/^\d+$/.test(appId)) {
+          // permissions=68608 = Send Messages (2048) + Read Message History (65536) + View Channels (1024)
+          const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&permissions=68608&scope=bot`;
+          p.log.info(`Invite URL: ${inviteUrl}`);
+          p.log.message('Open this URL in your browser to add the bot to your server.');
+        }
+      } catch {
+        // Token parsing failed, skip showing URL
+      }
+    }
 
     const dmPolicy = await p.select({
       message: 'Discord: Who can message the bot?',
@@ -706,11 +852,15 @@ async function stepChannels(config: OnboardConfig, env: Record<string, string>):
       'WhatsApp'
     );
     
-    const selfChat = await p.confirm({
-      message: 'WhatsApp: Self-chat mode? (Message Yourself)',
-      initialValue: config.whatsapp.selfChat ?? false,
+    const selfChat = await p.select({
+      message: 'WhatsApp: Whose number is this?',
+      options: [
+        { value: 'dedicated', label: 'Dedicated bot number', hint: 'Responds to all incoming messages' },
+        { value: 'personal', label: 'My personal number', hint: 'Only responds to "Message Yourself" chat' },
+      ],
+      initialValue: config.whatsapp.selfChat ? 'personal' : 'dedicated',
     });
-    if (!p.isCancel(selfChat)) config.whatsapp.selfChat = selfChat;
+    if (!p.isCancel(selfChat)) config.whatsapp.selfChat = selfChat === 'personal';
     
     // Access control (important since WhatsApp has full account access)
     const dmPolicy = await p.select({
@@ -755,6 +905,16 @@ async function stepChannels(config: OnboardConfig, env: Record<string, string>):
       initialValue: config.signal.phone || '',
     });
     if (!p.isCancel(phone) && phone) config.signal.phone = phone;
+    
+    const selfChat = await p.select({
+      message: 'Signal: Whose number is this?',
+      options: [
+        { value: 'dedicated', label: 'Dedicated bot number', hint: 'Responds to all incoming messages' },
+        { value: 'personal', label: 'My personal number', hint: 'Only responds to "Note to Self" chat' },
+      ],
+      initialValue: config.signal.selfChat ? 'personal' : 'dedicated',
+    });
+    if (!p.isCancel(selfChat)) config.signal.selfChat = selfChat === 'personal';
     
     // Access control
     const dmPolicy = await p.select({
@@ -812,6 +972,230 @@ async function stepFeatures(config: OnboardConfig): Promise<void> {
 }
 
 // ============================================================================
+// Google Workspace Setup (via gog CLI)
+// ============================================================================
+
+const GOG_SERVICES = ['gmail', 'calendar', 'drive', 'contacts', 'docs', 'sheets'];
+
+async function stepGoogle(config: OnboardConfig): Promise<void> {
+  // Ask if user wants to set up Google
+  const setupGoogle = await p.confirm({
+    message: 'Set up Google Workspace? (Gmail, Calendar, Drive, etc.)',
+    initialValue: config.google.enabled,
+  });
+  if (p.isCancel(setupGoogle)) { p.cancel('Setup cancelled'); process.exit(0); }
+  
+  if (!setupGoogle) {
+    config.google.enabled = false;
+    return;
+  }
+  
+  // Check if gog is installed
+  const gogInstalled = spawnSync('which', ['gog'], { stdio: 'pipe' }).status === 0;
+  
+  if (!gogInstalled) {
+    p.log.warning('gog CLI is not installed.');
+    
+    // Check if brew is available (macOS)
+    const brewInstalled = spawnSync('which', ['brew'], { stdio: 'pipe' }).status === 0;
+    
+    if (brewInstalled) {
+      const installGog = await p.confirm({
+        message: 'Install gog via Homebrew?',
+        initialValue: true,
+      });
+      if (p.isCancel(installGog)) { p.cancel('Setup cancelled'); process.exit(0); }
+      
+      if (installGog) {
+        const spinner = p.spinner();
+        spinner.start('Installing gog...');
+        
+        const result = spawnSync('brew', ['install', 'steipete/tap/gogcli'], { 
+          stdio: 'pipe',
+          timeout: 300000, // 5 min timeout
+        });
+        
+        if (result.status === 0) {
+          spinner.stop('gog installed successfully');
+        } else {
+          spinner.stop('Failed to install gog');
+          p.log.error('Installation failed. Try manually: brew install steipete/tap/gogcli');
+          config.google.enabled = false;
+          return;
+        }
+      } else {
+        p.log.info('Install gog manually: brew install steipete/tap/gogcli');
+        config.google.enabled = false;
+        return;
+      }
+    } else {
+      p.log.info('Install gog manually from: https://gogcli.sh');
+      config.google.enabled = false;
+      return;
+    }
+  }
+  
+  // Check for existing credentials
+  const credentialsResult = spawnSync('gog', ['auth', 'list'], { stdio: 'pipe' });
+  const hasCredentials = credentialsResult.status === 0 && 
+    credentialsResult.stdout.toString().trim().length > 0 &&
+    !credentialsResult.stdout.toString().includes('No accounts');
+  
+  if (!hasCredentials) {
+    // Check if credentials.json exists
+    const configDir = process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`;
+    const credPaths = [
+      `${configDir}/gogcli/credentials.json`,
+      `${process.env.HOME}/Library/Application Support/gogcli/credentials.json`,
+    ];
+    
+    const hasCredFile = credPaths.some(p => existsSync(p));
+    
+    if (!hasCredFile) {
+      p.note(
+        'To use Google Workspace, you need OAuth credentials:\n\n' +
+        '1. Go to console.cloud.google.com\n' +
+        '2. Create a project (or select existing)\n' +
+        '3. Enable APIs: Gmail, Calendar, Drive, etc.\n' +
+        '4. Create OAuth 2.0 credentials (Desktop app)\n' +
+        '5. Download the JSON file\n' +
+        '6. Run: gog auth credentials /path/to/credentials.json',
+        'Google OAuth Setup'
+      );
+      
+      const hasCredentials = await p.confirm({
+        message: 'Have you already set up OAuth credentials with gog?',
+        initialValue: false,
+      });
+      if (p.isCancel(hasCredentials)) { p.cancel('Setup cancelled'); process.exit(0); }
+      
+      if (!hasCredentials) {
+        p.log.info('Run `gog auth credentials /path/to/client_secret.json` after downloading credentials.');
+        config.google.enabled = false;
+        return;
+      }
+    }
+  }
+  
+  // List existing accounts or add new one
+  let accounts: string[] = [];
+  if (hasCredentials) {
+    const listResult = spawnSync('gog', ['auth', 'list', '--json'], { stdio: 'pipe' });
+    if (listResult.status === 0) {
+      try {
+        const parsed = JSON.parse(listResult.stdout.toString());
+        if (Array.isArray(parsed)) {
+          accounts = parsed.map((a: { email?: string; account?: string }) => a.email || a.account || '').filter(Boolean);
+        }
+      } catch {
+        // Parse as text output
+        accounts = listResult.stdout.toString()
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line.includes('@'));
+      }
+    }
+  }
+  
+  let selectedAccount: string | undefined;
+  
+  if (accounts.length > 0) {
+    const accountChoice = await p.select({
+      message: 'Google account',
+      options: [
+        ...accounts.map(a => ({ value: a, label: a, hint: 'Existing account' })),
+        { value: '__new__', label: 'Add new account', hint: 'Authorize another account' },
+      ],
+      initialValue: config.google.account || accounts[0],
+    });
+    if (p.isCancel(accountChoice)) { p.cancel('Setup cancelled'); process.exit(0); }
+    
+    if (accountChoice === '__new__') {
+      selectedAccount = await addGoogleAccount();
+    } else {
+      selectedAccount = accountChoice as string;
+    }
+  } else {
+    selectedAccount = await addGoogleAccount();
+  }
+  
+  if (!selectedAccount) {
+    config.google.enabled = false;
+    return;
+  }
+  
+  // Select services
+  const selectedServices = await p.multiselect({
+    message: 'Which Google services do you want to enable?',
+    options: GOG_SERVICES.map(s => ({
+      value: s,
+      label: s.charAt(0).toUpperCase() + s.slice(1),
+      hint: s === 'gmail' ? 'Read/send emails' : 
+            s === 'calendar' ? 'View/create events' :
+            s === 'drive' ? 'Access files' :
+            s === 'contacts' ? 'Look up contacts' :
+            s === 'docs' ? 'Read documents' :
+            'Read/edit spreadsheets',
+    })),
+    initialValues: config.google.services || ['gmail', 'calendar'],
+    required: true,
+  });
+  if (p.isCancel(selectedServices)) { p.cancel('Setup cancelled'); process.exit(0); }
+  
+  config.google.enabled = true;
+  config.google.account = selectedAccount;
+  config.google.services = selectedServices as string[];
+  
+  p.log.success(`Google Workspace configured: ${selectedAccount}`);
+}
+
+async function addGoogleAccount(): Promise<string | undefined> {
+  const email = await p.text({
+    message: 'Google account email',
+    placeholder: 'you@gmail.com',
+  });
+  if (p.isCancel(email) || !email) return undefined;
+  
+  const services = await p.multiselect({
+    message: 'Services to authorize',
+    options: GOG_SERVICES.map(s => ({
+      value: s,
+      label: s.charAt(0).toUpperCase() + s.slice(1),
+    })),
+    initialValues: ['gmail', 'calendar', 'drive', 'contacts'],
+    required: true,
+  });
+  if (p.isCancel(services)) return undefined;
+  
+  p.note(
+    'A browser window will open for Google authorization.\n' +
+    'Sign in with your Google account and grant permissions.',
+    'Authorization'
+  );
+  
+  const spinner = p.spinner();
+  spinner.start('Authorizing...');
+  
+  // Run gog auth add (this will open browser)
+  const result = spawnSync('gog', [
+    'auth', 'add', email,
+    '--services', (services as string[]).join(','),
+  ], { 
+    stdio: 'inherit', // Let it interact with terminal for browser auth
+    timeout: 300000, // 5 min timeout
+  });
+  
+  if (result.status === 0) {
+    spinner.stop('Account authorized');
+    return email;
+  } else {
+    spinner.stop('Authorization failed');
+    p.log.error('Failed to authorize account. Try manually: gog auth add ' + email);
+    return undefined;
+  }
+}
+
+// ============================================================================
 // Summary & Review
 // ============================================================================
 
@@ -847,7 +1231,7 @@ function showSummary(config: OnboardConfig): void {
   if (config.slack.enabled) channels.push('Slack');
   if (config.discord.enabled) channels.push('Discord');
   if (config.whatsapp.enabled) channels.push(config.whatsapp.selfChat ? 'WhatsApp (self)' : 'WhatsApp');
-  if (config.signal.enabled) channels.push('Signal');
+  if (config.signal.enabled) channels.push(config.signal.selfChat ? 'Signal (self)' : 'Signal');
   lines.push(`Channels:  ${channels.length > 0 ? channels.join(', ') : 'None'}`);
   
   // Features
@@ -855,6 +1239,11 @@ function showSummary(config: OnboardConfig): void {
   if (config.heartbeat.enabled) features.push(`Heartbeat (${config.heartbeat.interval}m)`);
   if (config.cron) features.push('Cron');
   lines.push(`Features:  ${features.length > 0 ? features.join(', ') : 'None'}`);
+  
+  // Google
+  if (config.google.enabled) {
+    lines.push(`Google:    ${config.google.account} (${config.google.services?.join(', ') || 'all'})`);
+  }
   
   p.note(lines.join('\n'), 'Configuration');
 }
@@ -873,6 +1262,7 @@ async function reviewLoop(config: OnboardConfig, env: Record<string, string>): P
         { value: 'agent', label: 'Change agent', hint: '' },
         { value: 'channels', label: 'Change channels', hint: '' },
         { value: 'features', label: 'Change features', hint: '' },
+        { value: 'google', label: 'Change Google Workspace', hint: '' },
       ],
     });
     if (p.isCancel(choice)) { p.cancel('Setup cancelled'); process.exit(0); }
@@ -890,6 +1280,7 @@ async function reviewLoop(config: OnboardConfig, env: Record<string, string>): P
     }
     else if (choice === 'channels') await stepChannels(config, env);
     else if (choice === 'features') await stepFeatures(config);
+    else if (choice === 'google') await stepGoogle(config);
   }
 }
 
@@ -897,7 +1288,8 @@ async function reviewLoop(config: OnboardConfig, env: Record<string, string>): P
 // Main Onboard Function
 // ============================================================================
 
-export async function onboard(): Promise<void> {
+export async function onboard(options?: { nonInteractive?: boolean }): Promise<void> {
+  const nonInteractive = options?.nonInteractive || false;
   // Temporary storage for wizard values
   const env: Record<string, string> = {};
   
@@ -907,6 +1299,128 @@ export async function onboard(): Promise<void> {
   const configPath = resolveConfigPath();
   const hasExistingConfig = existsSync(configPath);
   
+  // Non-interactive mode: read all config from env vars
+  if (nonInteractive) {
+    console.log('🤖 LettaBot Non-Interactive Setup\n');
+    console.log('Reading configuration from environment variables...\n');
+    
+    const config = readConfigFromEnv(existingConfig);
+    
+    // Show defaults being used
+    console.log('Configuration:');
+    console.log(`  Server: ${config.baseUrl}`);
+    if (!process.env.LETTA_BASE_URL) {
+      console.log('    (using default - override with LETTA_BASE_URL)');
+    }
+    
+    if (config.telegram.enabled) {
+      console.log(`  Telegram: enabled`);
+      console.log(`    DM Policy: ${config.telegram.dmPolicy}${!process.env.TELEGRAM_DM_POLICY ? ' (default)' : ''}`);
+    }
+    
+    if (config.slack.enabled) {
+      console.log(`  Slack: enabled`);
+      console.log(`    DM Policy: ${config.slack.dmPolicy}${!process.env.SLACK_DM_POLICY ? ' (default)' : ''}`);
+    }
+    
+    if (config.discord.enabled) {
+      console.log(`  Discord: enabled`);
+      console.log(`    DM Policy: ${config.discord.dmPolicy}${!process.env.DISCORD_DM_POLICY ? ' (default)' : ''}`);
+    }
+    
+    if (config.whatsapp.enabled) {
+      console.log(`  WhatsApp: enabled`);
+      console.log(`    Self-chat: ${config.whatsapp.selfChat}`);
+      console.log(`    DM Policy: ${config.whatsapp.dmPolicy}${!process.env.WHATSAPP_DM_POLICY ? ' (default)' : ''}`);
+      
+      // Check if this is first-time WhatsApp setup (no auth data exists)
+      const { existsSync } = await import('node:fs');
+      const { resolve } = await import('node:path');
+      const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+      const authPath = resolve(homeDir, '.wwebjs_auth');
+      const isFirstTime = !existsSync(authPath);
+      
+      if (isFirstTime) {
+        console.log('');
+        console.log('⚠️  CRITICAL: First-Time WhatsApp Setup');
+        console.log('   A QR code will print when you start the server.');
+        console.log('   You MUST see the QR code to scan it with your phone.');
+        console.log('');
+        console.log('   IF USING AN AI AGENT TO START THE SERVER:');
+        console.log('   - Tell the agent: "Run lettabot server in the FOREGROUND"');
+        console.log('   - OR: "Do NOT background the server process"');
+        console.log('   - The QR code output may be truncated - if you don\'t see it,');
+        console.log('     run "lettabot server" yourself in a terminal to see the full output');
+        console.log('');
+        console.log('   After first pairing, the server can be backgrounded normally.');
+      }
+    }
+    
+    if (config.signal.enabled) {
+      console.log(`  Signal: enabled`);
+      console.log(`    DM Policy: ${config.signal.dmPolicy}${!process.env.SIGNAL_DM_POLICY ? ' (default)' : ''}`);
+    }
+    
+    console.log('');
+    
+    // Validate required fields
+    if (!config.apiKey && isLettaCloudUrl(config.baseUrl)) {
+      console.error('❌ Error: LETTA_API_KEY is required');
+      console.error('   Get your API key from: https://app.letta.com/settings');
+      console.error('   Then run: export LETTA_API_KEY="letta_..."');
+      console.error('');
+      console.error('   Or use self-hosted Letta:');
+      console.error('   export LETTA_BASE_URL="http://localhost:8283"');
+      process.exit(1);
+    }
+    
+    // Validate at least one channel is enabled
+    const hasChannel = config.telegram.enabled || config.slack.enabled || config.discord.enabled || config.whatsapp.enabled || config.signal.enabled;
+    if (!hasChannel) {
+      console.error('❌ Error: At least one channel must be configured');
+      console.error('');
+      console.error('   Telegram:  export TELEGRAM_BOT_TOKEN="..." (from @BotFather)');
+      console.error('   Slack:     export SLACK_BOT_TOKEN="..." and SLACK_APP_TOKEN="..."');
+      console.error('   Discord:   export DISCORD_BOT_TOKEN="..."');
+      console.error('   WhatsApp:  export WHATSAPP_ENABLED=true and WHATSAPP_SELF_CHAT_MODE=true');
+      console.error('   Signal:    export SIGNAL_PHONE_NUMBER="+1234567890"');
+      process.exit(1);
+    }
+    
+    // CRITICAL: Validate WhatsApp self-chat is explicitly set
+    if (config.whatsapp.enabled && process.env.WHATSAPP_SELF_CHAT_MODE === undefined) {
+      console.error('❌ Error: WhatsApp requires explicit WHATSAPP_SELF_CHAT_MODE for safety');
+      console.error('');
+      console.error('   For personal number (SAFE - only "Message Yourself" chat):');
+      console.error('   export WHATSAPP_SELF_CHAT_MODE=true');
+      console.error('');
+      console.error('   For dedicated bot number (UNSAFE - responds to ALL messages):');
+      console.error('   export WHATSAPP_SELF_CHAT_MODE=false');
+      process.exit(1);
+    }
+    
+    // Test server connection
+    console.log(`Connecting to ${config.baseUrl}...`);
+    try {
+      const res = await fetch(`${config.baseUrl}/v1/health`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        console.log('✅ Connected to server\n');
+      } else {
+        console.error(`❌ Server returned status ${res.status}`);
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error(`❌ Could not connect to ${config.baseUrl}`);
+      process.exit(1);
+    }
+    
+    // Save config and exit
+    await saveConfigFromEnv(config, configPath);
+    console.log(`✅ Configuration saved to ${configPath}\n`);
+    console.log('Run "lettabot server" to start the bot.');
+    return;
+  }
+  
   p.intro('🤖 LettaBot Setup');
   
   if (hasExistingConfig) {
@@ -915,8 +1429,8 @@ export async function onboard(): Promise<void> {
   
   // Pre-populate from existing config
   const baseUrl = existingConfig.server.baseUrl || process.env.LETTA_BASE_URL || 'https://api.letta.com';
-  const isLocal = baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1');
-  p.note(`${baseUrl}\n${isLocal ? 'Local Docker' : 'Letta Cloud'}`, 'Server');
+  const isLocal = !isLettaCloudUrl(baseUrl);
+  p.note(`${baseUrl}\n${isLocal ? 'Self-hosted' : 'Letta Cloud'}`, 'Server');
   
   // Test server connection
   const spinner = p.spinner();
@@ -965,15 +1479,20 @@ export async function onboard(): Promise<void> {
     },
     whatsapp: { 
       enabled: existingConfig.channels.whatsapp?.enabled || false,
-      selfChat: existingConfig.channels.whatsapp?.selfChat,
+      selfChat: existingConfig.channels.whatsapp?.selfChat ?? true, // Default true
       dmPolicy: existingConfig.channels.whatsapp?.dmPolicy,
     },
     signal: { 
       enabled: existingConfig.channels.signal?.enabled || false,
       phone: existingConfig.channels.signal?.phone,
+      selfChat: existingConfig.channels.signal?.selfChat ?? true, // Default true
       dmPolicy: existingConfig.channels.signal?.dmPolicy,
     },
-    gmail: { enabled: false },
+    google: {
+      enabled: existingConfig.integrations?.google?.enabled || false,
+      account: existingConfig.integrations?.google?.account,
+      services: existingConfig.integrations?.google?.services,
+    },
     heartbeat: { 
       enabled: existingConfig.features?.heartbeat?.enabled || false,
       interval: existingConfig.features?.heartbeat?.intervalMin?.toString(),
@@ -1005,6 +1524,7 @@ export async function onboard(): Promise<void> {
   await stepModel(config, env);
   await stepChannels(config, env);
   await stepFeatures(config);
+  await stepGoogle(config);
   
   // Review loop
   await reviewLoop(config, env);
@@ -1074,6 +1594,9 @@ export async function onboard(): Promise<void> {
   
   if (config.signal.enabled && config.signal.phone) {
     env.SIGNAL_PHONE_NUMBER = config.signal.phone;
+    // Signal selfChat defaults to true, so only set env if explicitly false (dedicated number)
+    if (config.signal.selfChat === false) env.SIGNAL_SELF_CHAT_MODE = 'false';
+    else delete env.SIGNAL_SELF_CHAT_MODE;
     if (config.signal.dmPolicy) env.SIGNAL_DM_POLICY = config.signal.dmPolicy;
     if (config.signal.allowedUsers?.length) {
       env.SIGNAL_ALLOWED_USERS = config.signal.allowedUsers.join(',');
@@ -1082,6 +1605,7 @@ export async function onboard(): Promise<void> {
     }
   } else {
     delete env.SIGNAL_PHONE_NUMBER;
+    delete env.SIGNAL_SELF_CHAT_MODE;
     delete env.SIGNAL_DM_POLICY;
     delete env.SIGNAL_ALLOWED_USERS;
   }
@@ -1117,6 +1641,9 @@ export async function onboard(): Promise<void> {
     config.discord.enabled ? `  ✓ Discord (${formatAccess(config.discord.dmPolicy, config.discord.allowedUsers)})` : '  ✗ Discord',
     config.whatsapp.enabled ? `  ✓ WhatsApp (${formatAccess(config.whatsapp.dmPolicy, config.whatsapp.allowedUsers)})` : '  ✗ WhatsApp',
     config.signal.enabled ? `  ✓ Signal (${formatAccess(config.signal.dmPolicy, config.signal.allowedUsers)})` : '  ✗ Signal',
+    '',
+    'Integrations:',
+    config.google.enabled ? `  ✓ Google (${config.google.account} - ${config.google.services?.join(', ') || 'all'})` : '  ✗ Google Workspace',
     '',
     'Features:',
     config.heartbeat.enabled ? `  ✓ Heartbeat (${config.heartbeat.interval}min)` : '  ✗ Heartbeat',
@@ -1174,6 +1701,7 @@ export async function onboard(): Promise<void> {
         signal: {
           enabled: true,
           phone: config.signal.phone,
+          selfChat: config.signal.selfChat,
           dmPolicy: config.signal.dmPolicy,
           allowedUsers: config.signal.allowedUsers,
         }
@@ -1186,6 +1714,15 @@ export async function onboard(): Promise<void> {
         intervalMin: config.heartbeat.interval ? parseInt(config.heartbeat.interval) : undefined,
       },
     },
+    ...(config.google.enabled ? {
+      integrations: {
+        google: {
+          enabled: true,
+          account: config.google.account,
+          services: config.google.services,
+        },
+      },
+    } : {}),
   };
   
   // Add BYOK providers if configured

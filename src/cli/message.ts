@@ -100,28 +100,61 @@ async function sendSlack(chatId: string, text: string): Promise<void> {
 }
 
 async function sendSignal(chatId: string, text: string): Promise<void> {
-  const apiUrl = process.env.SIGNAL_CLI_REST_API_URL || 'http://localhost:8080';
+  // We talk to the signal-cli daemon JSON-RPC API (the same daemon the Signal adapter uses).
+  // This is *not* the signal-cli-rest-api container.
+  const apiUrl = process.env.SIGNAL_CLI_REST_API_URL || 'http://127.0.0.1:8090';
   const phoneNumber = process.env.SIGNAL_PHONE_NUMBER;
-  
+
   if (!phoneNumber) {
     throw new Error('SIGNAL_PHONE_NUMBER not set');
   }
-  
-  const response = await fetch(`${apiUrl}/v2/send`, {
+
+  // Support group IDs in the same format we use everywhere else.
+  const params: Record<string, unknown> = {
+    account: phoneNumber,
+    message: text,
+  };
+
+  if (chatId.startsWith('group:')) {
+    params.groupId = chatId.slice('group:'.length);
+  } else {
+    params.recipient = [chatId];
+  }
+
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'send',
+    params,
+    id: Date.now(),
+  });
+
+  const response = await fetch(`${apiUrl}/api/v1/rpc`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      message: text,
-      number: phoneNumber,
-      recipients: [chatId],
-    }),
+    body,
   });
-  
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Signal API error: ${error}`);
+
+  // signal-cli returns status 201 with empty body sometimes.
+  if (response.status === 201) {
+    console.log(`✓ Sent to signal:${chatId}`);
+    return;
   }
-  
+
+  const textBody = await response.text();
+  if (!response.ok) {
+    throw new Error(`Signal API error: ${textBody}`);
+  }
+
+  if (!textBody.trim()) {
+    console.log(`✓ Sent to signal:${chatId}`);
+    return;
+  }
+
+  const parsed = JSON.parse(textBody) as { result?: unknown; error?: { code?: number; message?: string } };
+  if (parsed.error) {
+    throw new Error(`Signal RPC ${parsed.error.code ?? 'unknown'}: ${parsed.error.message ?? 'unknown error'}`);
+  }
+
   console.log(`✓ Sent to signal:${chatId}`);
 }
 
@@ -257,7 +290,7 @@ Environment variables:
   SLACK_BOT_TOKEN         Required for Slack
   DISCORD_BOT_TOKEN       Required for Discord
   SIGNAL_PHONE_NUMBER     Required for Signal
-  SIGNAL_CLI_REST_API_URL Signal API URL (default: http://localhost:8080)
+  SIGNAL_CLI_REST_API_URL Signal daemon URL (default: http://127.0.0.1:8090)
 `);
 }
 

@@ -12,7 +12,7 @@ import { resolve } from 'node:path';
 import type { LettaBot } from '../core/bot.js';
 import type { TriggerContext } from '../core/types.js';
 import { buildHeartbeatPrompt } from '../core/prompts.js';
-import { getLastRunTime } from '../tools/letta-api.js';
+
 
 // Log file
 const LOG_PATH = resolve(process.cwd(), 'cron-log.jsonl');
@@ -106,11 +106,11 @@ export class HeartbeatService {
   
   /**
    * Manually trigger a heartbeat (for /heartbeat command)
-   * Bypasses the "recently active" check since user explicitly requested it
+   * Bypasses the "recently messaged" check since user explicitly requested it
    */
   async trigger(): Promise<void> {
     console.log('[Heartbeat] Manual trigger requested');
-    await this.runHeartbeat(true); // skipActiveCheck = true
+    await this.runHeartbeat(true); // skipRecentCheck = true
   }
   
   /**
@@ -119,9 +119,9 @@ export class HeartbeatService {
    * SILENT MODE: Agent's text output is NOT auto-delivered.
    * The agent must use `lettabot-message` CLI via Bash to contact the user.
    * 
-   * @param skipActiveCheck - If true, bypass the "recently active" check (for manual triggers)
+   * @param skipRecentCheck - If true, bypass the "recently messaged" check (for manual triggers)
    */
-  private async runHeartbeat(skipActiveCheck = false): Promise<void> {
+  private async runHeartbeat(skipRecentCheck = false): Promise<void> {
     const now = new Date();
     const formattedTime = now.toLocaleString();
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -130,25 +130,21 @@ export class HeartbeatService {
     console.log(`[Heartbeat] ⏰ RUNNING at ${formattedTime} [SILENT MODE]`);
     console.log(`${'='.repeat(60)}\n`);
     
-    // Check if agent was active recently (skip heartbeat if so)
-    // Skip this check for manual triggers (/heartbeat command)
-    if (!skipActiveCheck) {
-      const agentId = this.bot.getStatus().agentId;
-      if (agentId) {
-        const lastRunTime = await getLastRunTime(agentId);
-        if (lastRunTime) {
-          const msSinceLastRun = now.getTime() - lastRunTime.getTime();
-          const intervalMs = this.config.intervalMinutes * 60 * 1000;
-          
-          if (msSinceLastRun < intervalMs) {
-            const minutesAgo = Math.round(msSinceLastRun / 60000);
-            console.log(`[Heartbeat] Agent was active ${minutesAgo}m ago - skipping heartbeat`);
-            logEvent('heartbeat_skipped_active', {
-              lastRunTime: lastRunTime.toISOString(),
-              minutesAgo,
-            });
-            return;
-          }
+    // Skip if user sent a message in the last 5 minutes (unless manual trigger)
+    if (!skipRecentCheck) {
+      const lastUserMessage = this.bot.getLastUserMessageTime();
+      if (lastUserMessage) {
+        const msSinceLastMessage = now.getTime() - lastUserMessage.getTime();
+        const skipWindowMs = 5 * 60 * 1000; // 5 minutes
+        
+        if (msSinceLastMessage < skipWindowMs) {
+          const minutesAgo = Math.round(msSinceLastMessage / 60000);
+          console.log(`[Heartbeat] User messaged ${minutesAgo}m ago - skipping heartbeat`);
+          logEvent('heartbeat_skipped_recent_user', {
+            lastUserMessage: lastUserMessage.toISOString(),
+            minutesAgo,
+          });
+          return;
         }
       }
     }

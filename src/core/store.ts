@@ -53,6 +53,15 @@ export class Store {
     this.save();
   }
   
+  get conversationId(): string | null {
+    return this.data.conversationId || null;
+  }
+  
+  set conversationId(id: string | null) {
+    this.data.conversationId = id;
+    this.save();
+  }
+  
   get baseUrl(): string | undefined {
     return this.data.baseUrl;
   }
@@ -65,9 +74,10 @@ export class Store {
   /**
    * Set agent ID and associated server URL together
    */
-  setAgent(id: string | null, baseUrl?: string): void {
+  setAgent(id: string | null, baseUrl?: string, conversationId?: string): void {
     this.data.agentId = id;
     this.data.baseUrl = baseUrl;
+    this.data.conversationId = conversationId || this.data.conversationId;
     this.data.lastUsedAt = new Date().toISOString();
     if (id && !this.data.createdAt) {
       this.data.createdAt = new Date().toISOString();

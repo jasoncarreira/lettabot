@@ -13,8 +13,19 @@ import { loadConfig, applyConfigToEnv } from './config/index.js';
 const config = loadConfig();
 applyConfigToEnv(config);
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import updateNotifier from 'update-notifier';
+
+// Get the directory where this CLI file is located (works with npx, global install, etc.)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Check for updates (runs in background, shows notification if update available)
+const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf-8'));
+updateNotifier({ pkg }).notify();
+
 import * as readline from 'node:readline';
 
 const args = process.argv.slice(2);
@@ -98,7 +109,8 @@ async function server() {
   console.log('Starting LettaBot server...\n');
   
   // Start the bot using the compiled JS
-  const mainPath = resolve(process.cwd(), 'dist/main.js');
+  // Use __dirname to find main.js relative to this CLI file (works with npx, global install, etc.)
+  const mainPath = resolve(__dirname, 'main.js');
   if (existsSync(mainPath)) {
     spawn('node', [mainPath], {
       stdio: 'inherit',
@@ -106,12 +118,20 @@ async function server() {
       env: { ...process.env },
     });
   } else {
-    // Fallback to tsx for development
-    const mainTsPath = new URL('./main.ts', import.meta.url).pathname;
-    spawn('npx', ['tsx', mainTsPath], {
-      stdio: 'inherit',
-      cwd: process.cwd(),
-    });
+    // Fallback to tsx for development - look for src/main.ts relative to package root
+    const packageRoot = resolve(__dirname, '..');
+    const mainTsPath = resolve(packageRoot, 'src/main.ts');
+    if (existsSync(mainTsPath)) {
+      spawn('npx', ['tsx', mainTsPath], {
+        stdio: 'inherit',
+        cwd: process.cwd(),
+      });
+    } else {
+      console.error('Error: Could not find main.js or main.ts');
+      console.error(`  Looked for: ${mainPath}`);
+      console.error(`  Looked for: ${mainTsPath}`);
+      process.exit(1);
+    }
   }
 }
 
@@ -192,7 +212,8 @@ async function main() {
     case 'onboard':
     case 'setup':
     case 'init':
-      await onboard();
+      const nonInteractive = args.includes('--non-interactive') || args.includes('-n');
+      await onboard({ nonInteractive });
       break;
       
     case 'server':

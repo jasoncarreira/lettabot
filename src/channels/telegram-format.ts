@@ -5,18 +5,18 @@
  * Supports: headers, bold, italic, code, links, blockquotes, lists, etc.
  */
 
-import { convert } from 'telegram-markdown-v2';
-
 /**
  * Convert markdown to Telegram MarkdownV2 format.
  * Handles proper escaping of special characters.
  */
-export function markdownToTelegramV2(markdown: string): string {
+export async function markdownToTelegramV2(markdown: string): Promise<string> {
   try {
+    // Dynamic import to avoid ESM/CommonJS compatibility issues
+    const { convert } = await import('telegram-markdown-v2');
     // Use 'keep' strategy to preserve blockquotes (>) and other elements
     return convert(markdown, 'keep');
   } catch (e) {
-    console.error('[Telegram] Markdown conversion failed:', e);
+    console.error('[Telegram] Markdown conversion failed, using fallback:', e);
     // Fallback: escape special characters manually
     return escapeMarkdownV2(markdown);
   }

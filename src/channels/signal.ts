@@ -6,14 +6,18 @@
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, OutboundMessage } from '../core/types.js';
+import type { InboundAttachment, InboundMessage, OutboundMessage } from '../core/types.js';
 import type { DmPolicy } from '../pairing/types.js';
 import {
   isUserAllowed,
   upsertPairingRequest,
 } from '../pairing/store.js';
+import { buildAttachmentPath } from './attachments.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { copyFile, stat } from 'node:fs/promises';
 
 export interface SignalConfig {
   phoneNumber: string;        // Bot's phone number (E.164 format, e.g., +15551234567)
@@ -25,6 +29,8 @@ export interface SignalConfig {
   dmPolicy?: DmPolicy;        // 'pairing' (default), 'allowlist', or 'open'
   allowedUsers?: string[];    // Phone numbers (config allowlist)
   selfChatMode?: boolean;     // Respond to Note to Self (default: true)
+  attachmentsDir?: string;
+  attachmentsMaxBytes?: number;
 }
 
 type SignalRpcResponse<T> = {
@@ -46,6 +52,15 @@ type SignalSseEvent = {
         groupId?: string;
         groupName?: string;
       };
+      attachments?: Array<{
+        contentType?: string;
+        filename?: string;
+        id?: string;
+        size?: number;
+        width?: number;
+        height?: number;
+        caption?: string;
+      }>;
     };
     syncMessage?: {
       sentMessage?: {
@@ -57,6 +72,15 @@ type SignalSseEvent = {
           groupId?: string;
           groupName?: string;
         };
+        attachments?: Array<{
+          contentType?: string;
+          filename?: string;
+          id?: string;
+          size?: number;
+          width?: number;
+          height?: number;
+          caption?: string;
+        }>;
       };
     };
     typingMessage?: {
@@ -444,6 +468,11 @@ This code expires in 1 hour.`;
       
       if (!envelope) return;
       
+      // Debug: log when we receive any message
+      if (envelope.dataMessage || envelope.syncMessage) {
+        console.log('[Signal] Received envelope:', JSON.stringify(envelope, null, 2));
+      }
+      
       // Handle incoming data messages (from others)
       const dataMessage = envelope.dataMessage;
       
@@ -455,23 +484,26 @@ This code expires in 1 hour.`;
       let source: string | undefined;
       let chatId: string | undefined;
       let groupInfo: { groupId?: string; groupName?: string } | undefined;
+      let attachments: Array<{ contentType?: string; filename?: string; id?: string }> | undefined;
       
-      if (dataMessage?.message) {
+      if (dataMessage?.message || dataMessage?.attachments?.length) {
         // Regular incoming message
         messageText = dataMessage.message;
         source = envelope.source || envelope.sourceUuid;
         groupInfo = dataMessage.groupInfo;
+        attachments = dataMessage.attachments;
         
         if (groupInfo?.groupId) {
           chatId = `group:${groupInfo.groupId}`;
         } else {
           chatId = source;
         }
-      } else if (syncMessage?.message) {
+      } else if (syncMessage?.message || syncMessage?.attachments?.length) {
         // Sync message (Note to Self or sent from another device)
         messageText = syncMessage.message;
         source = syncMessage.destination || syncMessage.destinationUuid;
         groupInfo = syncMessage.groupInfo;
+        attachments = syncMessage.attachments;
         
         // For Note to Self, destination is our own number
         const isNoteToSelf = source === this.config.phoneNumber || 
@@ -487,20 +519,76 @@ This code expires in 1 hour.`;
         }
       }
       
-      if (!messageText || !source || !chatId) {
+      // Check if we have a valid message before attachment processing
+      if (!source || !chatId) {
+        return;
+      }
+      
+      // Handle voice message attachments
+      const voiceAttachment = attachments?.find(a => a.contentType?.startsWith('audio/'));
+      if (voiceAttachment?.id) {
+        console.log(`[Signal] Voice attachment detected: ${voiceAttachment.contentType}, id: ${voiceAttachment.id}`);
+        try {
+          const { loadConfig } = await import('../config/index.js');
+          const config = loadConfig();
+          if (!config.transcription?.apiKey && !process.env.OPENAI_API_KEY) {
+            if (chatId) {
+              await this.sendMessage({ 
+                chatId, 
+                text: 'Voice messages require OpenAI API key for transcription. See: https://github.com/letta-ai/lettabot#voice-messages' 
+              });
+            }
+          } else {
+            // Read attachment from signal-cli attachments directory
+            const { readFileSync } = await import('node:fs');
+            const { homedir } = await import('node:os');
+            const { join } = await import('node:path');
+            
+            const attachmentPath = join(homedir(), '.local/share/signal-cli/attachments', voiceAttachment.id);
+            console.log(`[Signal] Reading attachment from: ${attachmentPath}`);
+            const buffer = readFileSync(attachmentPath);
+            console.log(`[Signal] Read ${buffer.length} bytes`);
+            
+            const { transcribeAudio } = await import('../transcription/index.js');
+            const ext = voiceAttachment.contentType?.split('/')[1] || 'ogg';
+            const transcript = await transcribeAudio(buffer, `voice.${ext}`);
+            
+            console.log(`[Signal] Transcribed voice message: "${transcript.slice(0, 50)}..."`);
+            messageText = (messageText ? messageText + '\n' : '') + `[Voice message]: ${transcript}`;
+          }
+        } catch (error) {
+          console.error('[Signal] Error transcribing voice message:', error);
+        }
+      }
+      
+      // Collect non-voice attachments (images, files, etc.)
+      const collectedAttachments = await this.collectSignalAttachments(attachments, chatId);
+      
+      // After processing attachments, check if we have any message content.
+      // If this was a voice-only message and transcription failed/was disabled,
+      // still forward a placeholder so the user knows we got it.
+      if (!messageText && voiceAttachment?.id) {
+        messageText = '[Voice message received]';
+      }
+      if (!messageText && collectedAttachments.length === 0) {
         return;
       }
       
       // Handle Note to Self - check selfChatMode
+      console.log(`[Signal] Processing message: chatId=${chatId}, source=${source}, selfChatMode=${this.config.selfChatMode}`);
       if (chatId === 'note-to-self') {
         if (!this.config.selfChatMode) {
           // selfChatMode disabled - ignore Note to Self messages
+          console.log('[Signal] Note to Self ignored (selfChatMode disabled)');
           return;
         }
         // selfChatMode enabled - allow the message through
+        console.log('[Signal] Note to Self allowed (selfChatMode enabled)');
       } else {
         // External message - check access control
+        console.log('[Signal] Checking access for external message');
         const access = await this.checkAccess(source);
+        console.log(`[Signal] Access result: ${access}`);
         
         if (access === 'blocked') {
           console.log(`[Signal] Blocked message from unauthorized user: ${source}`);
@@ -538,10 +626,11 @@ This code expires in 1 hour.`;
         channel: 'signal',
         chatId,
         userId: source,
-        text: messageText,
+        text: messageText || '',
         timestamp: new Date(envelope.timestamp || Date.now()),
         isGroup,
         groupName: groupInfo?.groupName,
+        attachments: collectedAttachments.length > 0 ? collectedAttachments : undefined,
       };
       
       this.onMessage?.(msg).catch((err) => {
@@ -597,5 +686,68 @@ This code expires in 1 hour.`;
     }
     
     return parsed.result as T;
+  }
+
+  /**
+   * Collect attachments from a Signal message
+   * Copies from signal-cli's attachments directory to our attachments directory
+   */
+  private async collectSignalAttachments(
+    attachments: Array<{ contentType?: string; filename?: string; id?: string; size?: number; width?: number; height?: number; caption?: string }> | undefined,
+    chatId: string
+  ): Promise<InboundAttachment[]> {
+    if (!attachments || attachments.length === 0) return [];
+    if (!this.config.attachmentsDir) return [];
+    
+    const results: InboundAttachment[] = [];
+    const signalAttachmentsDir = join(homedir(), '.local/share/signal-cli/attachments');
+    
+    for (const attachment of attachments) {
+      // Skip voice attachments - handled separately by transcription
+      if (attachment.contentType?.startsWith('audio/')) continue;
+      
+      if (!attachment.id) continue;
+      
+      const sourcePath = join(signalAttachmentsDir, attachment.id);
+      const name = attachment.filename || attachment.id;
+      
+      const entry: InboundAttachment = {
+        id: attachment.id,
+        name,
+        mimeType: attachment.contentType,
+        size: attachment.size,
+        kind: attachment.contentType?.startsWith('image/') ? 'image' 
+            : attachment.contentType?.startsWith('video/') ? 'video'
+            : 'file',
+      };
+      
+      // Check size limit
+      if (this.config.attachmentsMaxBytes && this.config.attachmentsMaxBytes > 0) {
+        try {
+          const stats = await stat(sourcePath);
+          if (stats.size > this.config.attachmentsMaxBytes) {
+            console.warn(`[Signal] Attachment ${name} exceeds size limit, skipping download.`);
+            results.push(entry);
+            continue;
+          }
+        } catch {
+          // File might not exist
+        }
+      }
+      
+      // Copy to our attachments directory
+      const target = buildAttachmentPath(this.config.attachmentsDir, 'signal', chatId, name);
+      try {
+        await copyFile(sourcePath, target);
+        entry.localPath = target;
+        console.log(`[Signal] Attachment saved to ${target}`);
+      } catch (err) {
+        console.warn('[Signal] Failed to copy attachment:', err);
+      }
+      
+      results.push(entry);
+    }
+    
+    return results;
   }
 }

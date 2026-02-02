@@ -6,9 +6,10 @@
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, OutboundMessage } from '../core/types.js';
+import type { InboundAttachment, InboundMessage, OutboundFile, OutboundMessage } from '../core/types.js';
 import type { DmPolicy } from '../pairing/types.js';
 import { isUserAllowed, upsertPairingRequest } from '../pairing/store.js';
+import { buildAttachmentPath, downloadToFile } from './attachments.js';
 
 // Dynamic import to avoid requiring Discord deps if not used
 let Client: typeof import('discord.js').Client;
@@ -19,6 +20,8 @@ export interface DiscordConfig {
   token: string;
   dmPolicy?: DmPolicy;      // 'pairing' (default), 'allowlist', or 'open'
   allowedUsers?: string[];  // Discord user IDs
+  attachmentsDir?: string;
+  attachmentsMaxBytes?: number;
 }
 
 export class DiscordAdapter implements ChannelAdapter {
@@ -28,6 +31,8 @@ export class DiscordAdapter implements ChannelAdapter {
   private client: InstanceType<typeof Client> | null = null;
   private config: DiscordConfig;
   private running = false;
+  private attachmentsDir?: string;
+  private attachmentsMaxBytes?: number;
 
   onMessage?: (msg: InboundMessage) => Promise<void>;
   onCommand?: (command: string) => Promise<string | null>;
@@ -37,6 +42,8 @@ export class DiscordAdapter implements ChannelAdapter {
       ...config,
       dmPolicy: config.dmPolicy || 'pairing',
     };
+    this.attachmentsDir = config.attachmentsDir;
+    this.attachmentsMaxBytes = config.attachmentsMaxBytes;
   }
 
   /**
@@ -132,9 +139,34 @@ Ask the bot owner to approve with:
     this.client.on('messageCreate', async (message) => {
       if (message.author?.bot) return;
 
-      const content = (message.content || '').trim();
+      let content = (message.content || '').trim();
       const userId = message.author?.id;
       if (!userId) return;
+      
+      // Handle audio attachments
+      const audioAttachment = message.attachments.find(a => a.contentType?.startsWith('audio/'));
+      if (audioAttachment?.url) {
+        try {
+          const { loadConfig } = await import('../config/index.js');
+          const config = loadConfig();
+          if (!config.transcription?.apiKey && !process.env.OPENAI_API_KEY) {
+            await message.reply('Voice messages require OpenAI API key for transcription. See: https://github.com/letta-ai/lettabot#voice-messages');
+          } else {
+            // Download audio
+            const response = await fetch(audioAttachment.url);
+            const buffer = Buffer.from(await response.arrayBuffer());
+            
+            const { transcribeAudio } = await import('../transcription/index.js');
+            const ext = audioAttachment.contentType?.split('/')[1] || 'mp3';
+            const transcript = await transcribeAudio(buffer, audioAttachment.name || `audio.${ext}`);
+            
+            console.log(`[Discord] Transcribed audio: "${transcript.slice(0, 50)}..."`);
+            content = (content ? content + '\n' : '') + `[Voice message]: ${transcript}`;
+          }
+        } catch (error) {
+          console.error('[Discord] Error transcribing audio:', error);
+        }
+      }
 
       const access = await this.checkAccess(userId);
       if (access === 'blocked') {
@@ -165,7 +197,8 @@ Ask the bot owner to approve with:
         return;
       }
 
-      if (!content) return;
+      const attachments = await this.collectAttachments(message.attachments, message.channel.id);
+      if (!content && attachments.length === 0) return;
 
       if (content.startsWith('/')) {
         const command = content.slice(1).split(/\s+/)[0]?.toLowerCase();
@@ -178,7 +211,10 @@ Ask the bot owner to approve with:
             return;
           }
           if (command === 'heartbeat') {
-            await this.onCommand('heartbeat');
+            const result = await this.onCommand('heartbeat');
+            if (result) {
+              await message.channel.send(result);
+            }
             return;
           }
         }
@@ -196,10 +232,11 @@ Ask the bot owner to approve with:
           userName: displayName,
           userHandle: message.author.username,
           messageId: message.id,
-          text: content,
+          text: content || '',
           timestamp: message.createdAt,
           isGroup,
           groupName,
+          attachments,
         });
       }
     });
@@ -263,4 +300,51 @@ Ask the bot owner to approve with:
   supportsEditing(): boolean {
     return true;
   }
+
+  private async collectAttachments(attachments: unknown, channelId: string): Promise<InboundAttachment[]> {
+    if (!attachments || typeof attachments !== 'object') return [];
+    const list = Array.from((attachments as { values: () => Iterable<DiscordAttachment> }).values?.() || []);
+    if (list.length === 0) return [];
+    const results: InboundAttachment[] = [];
+    for (const attachment of list) {
+      const name = attachment.name || attachment.id || 'attachment';
+      const entry: InboundAttachment = {
+        id: attachment.id,
+        name,
+        mimeType: attachment.contentType || undefined,
+        size: attachment.size,
+        kind: attachment.contentType?.startsWith('image/') ? 'image' : 'file',
+        url: attachment.url,
+      };
+      if (this.attachmentsDir && attachment.url) {
+        if (this.attachmentsMaxBytes === 0) {
+          results.push(entry);
+          continue;
+        }
+        if (this.attachmentsMaxBytes && attachment.size && attachment.size > this.attachmentsMaxBytes) {
+          console.warn(`[Discord] Attachment ${name} exceeds size limit, skipping download.`);
+          results.push(entry);
+          continue;
+        }
+        const target = buildAttachmentPath(this.attachmentsDir, 'discord', channelId, name);
+        try {
+          await downloadToFile(attachment.url, target);
+          entry.localPath = target;
+          console.log(`[Discord] Attachment saved to ${target}`);
+        } catch (err) {
+          console.warn('[Discord] Failed to download attachment:', err);
+        }
+      }
+      results.push(entry);
+    }
+    return results;
+  }
 }
+
+type DiscordAttachment = {
+  id?: string;
+  name?: string | null;
+  contentType?: string | null;
+  size?: number;
+  url?: string;
+};

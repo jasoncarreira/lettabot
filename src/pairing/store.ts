@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import type { PairingRequest, PairingStore, AllowFromStore } from './types.js';
+import { normalizePhoneForStorage } from '../utils/phone.js';
 
 // Configuration
 const CODE_LENGTH = 8;
@@ -107,10 +108,10 @@ export async function addToAllowFrom(channel: string, userId: string): Promise<v
   const filePath = getAllowFromPath(channel);
   const store = await readJson<AllowFromStore>(filePath, { version: 1, allowFrom: [] });
   const allowFrom = store.allowFrom || [];
-  
-  const normalized = String(userId).trim();
+
+  const normalized = normalizePhoneForStorage(userId);
   if (!normalized || allowFrom.includes(normalized)) return;
-  
+
   allowFrom.push(normalized);
   await writeJson(filePath, { version: 1, allowFrom });
 }
@@ -123,13 +124,16 @@ export async function isUserAllowed(
   userId: string,
   configAllowlist?: string[]
 ): Promise<boolean> {
-  const normalized = String(userId).trim();
-  
-  // Check config allowlist first
-  if (configAllowlist && configAllowlist.includes(normalized)) {
-    return true;
+  const normalized = normalizePhoneForStorage(userId);
+
+  // Check config allowlist first (normalize each entry for comparison)
+  if (configAllowlist) {
+    const normalizedConfig = configAllowlist.map(id => normalizePhoneForStorage(id));
+    if (normalizedConfig.includes(normalized)) {
+      return true;
+    }
   }
-  
+
   // Check stored allowFrom
   const storeAllowFrom = await readAllowFrom(channel);
   return storeAllowFrom.includes(normalized);

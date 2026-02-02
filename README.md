@@ -1,15 +1,16 @@
 # LettaBot
 
-Your personal AI assistant that remembers everything across **Telegram, Slack, WhatsApp, and Signal**. Powered by the [Letta Code SDK](https://github.com/letta-ai/letta-code-sdk).
+Your personal AI assistant that remembers everything across **Telegram, Slack, Discord, WhatsApp, and Signal**. Powered by the [Letta Code SDK](https://github.com/letta-ai/letta-code-sdk).
 
 <img width="750" alt="lettabot-preview" src="https://github.com/user-attachments/assets/9f01b845-d5b0-447b-927d-ae15f9ec7511" />
 
 ## Features
 
-- **Multi-Channel** - Chat seamlessly across Telegram, Slack, WhatsApp, and Signal
+- **Multi-Channel** - Chat seamlessly across Telegram, Slack, Discord, WhatsApp, and Signal
 - **Unified Memory** - Single agent remembers everything from all channels
 - **Persistent Memory** - Agent remembers conversations across sessions (days/weeks/months)
 - **Local Tool Execution** - Agent can read files, search code, run commands on your machine
+- **Voice Messages** - Automatic transcription via OpenAI Whisper
 - **Heartbeat** - Periodic check-ins where the agent reviews tasks
 - **Scheduling** - Agent can create one-off reminders and recurring tasks
 - **Streaming Responses** - Real-time message updates as the agent thinks
@@ -18,7 +19,7 @@ Your personal AI assistant that remembers everything across **Telegram, Slack, W
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - A Letta API key from [app.letta.com](https://app.letta.com) (or a running [Letta Docker server](https://docs.letta.com/guides/docker/))
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
@@ -37,6 +38,17 @@ npm run build
 npm link
 ```
 
+### Update
+
+```bash
+# Pull latest changes
+git pull origin main
+
+# Reinstall dependencies and rebuild
+npm install
+npm run build
+```
+
 #### Optional: Run a Letta Docker server 
 You can use `lettabot` with a Docker server with: 
 ```
@@ -50,9 +62,29 @@ See the [documentation](https://docs.letta.com/guides/docker/) for more details 
 
 ### Setup
 
-Run the interactive onboarding wizard:
+**Option 1: AI-Assisted Setup (Recommended)**
+
+Paste this into Letta Code, Claude Code, Cursor, or any AI coding assistant:
+
+```
+Clone https://github.com/letta-ai/lettabot, read the SKILL.md
+for setup instructions, and help me configure Telegram.
+```
+
+You'll need:
+- A Letta API key from [app.letta.com](https://app.letta.com) (or a [Letta Docker server](https://docs.letta.com/guides/docker/))
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+
+The AI will handle cloning, installing, and configuration autonomously.
+
+**Option 2: Interactive Wizard**
+
+For manual step-by-step setup:
 
 ```bash
+git clone https://github.com/letta-ai/lettabot.git
+cd lettabot
+npm install && npm run build && npm link
 lettabot onboard
 ```
 
@@ -63,6 +95,33 @@ lettabot server
 ```
 
 That's it! Message your bot on Telegram.
+
+> **Note:** For detailed environment variable reference and multi-channel setup, see [SKILL.md](./SKILL.md)
+
+## Voice Messages
+
+LettaBot can transcribe voice messages using OpenAI Whisper. Voice messages are automatically converted to text and sent to the agent with a `[Voice message]:` prefix.
+
+**Supported channels:** Telegram, WhatsApp, Signal, Slack, Discord
+
+### Configuration
+
+Add your OpenAI API key to `lettabot.config.yaml`:
+
+```yaml
+transcription:
+  provider: openai
+  apiKey: sk-...
+  model: whisper-1  # optional, defaults to whisper-1
+```
+
+Or set via environment variable:
+
+```bash
+export OPENAI_API_KEY=sk-...
+```
+
+If no API key is configured, voice messages are silently ignored.
 
 ## Skills
 LettaBot is compatible with [skills.sh](https://skills.sh) and [Clawdhub](https://clawdhub.com/). 
@@ -90,6 +149,27 @@ lettabot skills
 lettabot skills status
 ```
 
+### Home Assistant
+
+Control your smart home with LettaBot:
+
+```bash
+# 1. Install the skill from ClawdHub
+npx clawdhub@latest install homeassistant
+
+# 2. Enable the skill
+lettabot skills sync
+# Select "homeassistant" from the list
+
+# 3. Configure credentials (see skill docs for details)
+# You'll need: HA URL + Long-Lived Access Token
+```
+
+Then ask your bot things like:
+- "Turn off the living room lights"
+- "What's the temperature in the bedroom?"
+- "Set the thermostat to 72"
+
 ## CLI Commands
 
 | Command | Description |
@@ -108,9 +188,10 @@ LettaBot uses a **single agent with a single conversation** across all channels:
 
 ```
 Telegram ──┐
-           ├──→ ONE AGENT ──→ ONE CONVERSATION
-Slack ─────┤    (memory)      (chat history)
-WhatsApp ──┘
+Slack ─────┤
+Discord ───┼──→ ONE AGENT ──→ ONE CONVERSATION
+WhatsApp ──┤    (memory)      (chat history)
+Signal ────┘
 ```
 
 - Start a conversation on Telegram
@@ -122,6 +203,7 @@ WhatsApp ──┘
 |---------|-------|--------------|
 | Telegram | [Setup Guide](docs/getting-started.md) | Bot token from @BotFather |
 | Slack | [Setup Guide](docs/slack-setup.md) | Slack app with Socket Mode |
+| Discord | [Setup Guide](docs/discord-setup.md) | Discord bot + Message Content Intent |
 | WhatsApp | [Setup Guide](docs/whatsapp-setup.md) | Phone with WhatsApp |
 | Signal | [Setup Guide](docs/signal-setup.md) | signal-cli + phone number |
 
@@ -151,6 +233,7 @@ letta --agent <agent_id>
 |---------|-----------------|---------------|
 | Telegram | Long-polling (outbound HTTP) | None |
 | Slack | Socket Mode (outbound WebSocket) | None |
+| Discord | Gateway (outbound WebSocket) | None |
 | WhatsApp | Outbound WebSocket via Baileys | None |
 | Signal | Local daemon on 127.0.0.1 | None |
 
@@ -214,6 +297,7 @@ lettabot destroy
 
 - [Getting Started](docs/getting-started.md)
 - [Slack Setup](docs/slack-setup.md)
+- [Discord Setup](docs/discord-setup.md)
 - [WhatsApp Setup](docs/whatsapp-setup.md)
 - [Signal Setup](docs/signal-setup.md)
 

@@ -125,10 +125,16 @@ export function configToEnv(config: LettaBotConfig): Record<string, string> {
     env.WHATSAPP_ENABLED = 'true';
     if (config.channels.whatsapp.selfChat) {
       env.WHATSAPP_SELF_CHAT_MODE = 'true';
+    } else {
+      env.WHATSAPP_SELF_CHAT_MODE = 'false';
     }
   }
   if (config.channels.signal?.phone) {
     env.SIGNAL_PHONE_NUMBER = config.channels.signal.phone;
+    // Signal selfChat defaults to true, so only set env if explicitly false
+    if (config.channels.signal.selfChat === false) {
+      env.SIGNAL_SELF_CHAT_MODE = 'false';
+    }
   }
   if (config.channels.discord?.token) {
     env.DISCORD_BOT_TOKEN = config.channels.discord.token;
@@ -146,6 +152,18 @@ export function configToEnv(config: LettaBotConfig): Record<string, string> {
   }
   if (config.features?.heartbeat?.enabled) {
     env.HEARTBEAT_INTERVAL_MIN = String(config.features.heartbeat.intervalMin || 30);
+  }
+  
+  // Integrations - Google (Gmail polling)
+  if (config.integrations?.google?.enabled && config.integrations.google.account) {
+    env.GMAIL_ACCOUNT = config.integrations.google.account;
+  }
+
+  if (config.attachments?.maxMB !== undefined) {
+    env.ATTACHMENTS_MAX_MB = String(config.attachments.maxMB);
+  }
+  if (config.attachments?.maxAgeDays !== undefined) {
+    env.ATTACHMENTS_MAX_AGE_DAYS = String(config.attachments.maxAgeDays);
   }
   
   return env;

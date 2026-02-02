@@ -47,41 +47,29 @@ export async function runSlackWizard(existingConfig?: {
   p.intro('🔧 Slack Setup Wizard');
   
   p.note(
-    'This wizard will guide you through creating a Slack app with Socket Mode.\n' +
-    'We\'ll open your browser at each step and wait for you to complete the action.\n\n' +
-    'Total time: ~3 minutes\n' +
+    'This wizard creates a Slack app using a pre-configured manifest.\n' +
+    'All permissions and settings are configured automatically!\n\n' +
+    'Total time: ~2 minutes\n' +
     'Press Ctrl+C to cancel anytime',
     'Overview'
   );
   
-  // Step 1: Create Slack App
+  // Step 1: Create Slack App from Manifest (scopes, events, Socket Mode all pre-configured)
   const createdApp = await stepCreateApp();
   if (!createdApp) return null;
   
-  // Step 2: Enable Socket Mode + Get App Token
-  const appToken = await stepEnableSocketMode(existingConfig?.appToken);
-  if (!appToken) return null;
-  
-  // Step 3: Set Bot Permissions
-  const configuredScopes = await stepConfigureScopes();
-  if (!configuredScopes) return null;
-  
-  // Step 4: Enable Events
-  const configuredEvents = await stepConfigureEvents();
-  if (!configuredEvents) return null;
-  
-  // Step 5: Configure App Home
-  const configuredHome = await stepConfigureAppHome();
-  if (!configuredHome) return null;
-  
-  // Step 6: Install to Workspace + Get Bot Token
+  // Step 2: Install to Workspace + Get Bot Token
   const botToken = await stepInstallApp(existingConfig?.botToken);
   if (!botToken) return null;
   
-  // Step 7: Validate tokens
+  // Step 3: Enable Socket Mode + Get App Token
+  const appToken = await stepEnableSocketMode(existingConfig?.appToken);
+  if (!appToken) return null;
+  
+  // Validate tokens
   await validateSlackTokens(appToken, botToken);
   
-  // Step 8: Access control
+  // Access control
   const allowedUsers = await stepAccessControl(existingConfig?.allowedUsers);
   
   p.outro('✅ Slack setup complete!');
@@ -94,11 +82,49 @@ export async function runSlackWizard(existingConfig?: {
 }
 
 async function stepCreateApp(): Promise<boolean> {
-  p.log.step('Step 1/6: Create Slack App');
+  p.log.step('Step 1/3: Create Slack App from Manifest');
   
-  // Open browser first
+  // Inline manifest for Socket Mode configuration
+  const appName = process.env.SLACK_APP_NAME || process.env.LETTA_AGENT_NAME || 'LettaBot';
+  const manifest = `display_information:
+  name: ${appName}
+  description: AI assistant with Socket Mode for real-time conversations
+  background_color: "#2c2d30"
+features:
+  bot_user:
+    display_name: ${appName}
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - im:history
+      - im:read
+      - im:write
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im`;
+  
+  const manifestEncoded = encodeURIComponent(manifest);
+  const url = `https://api.slack.com/apps?new_app=1&manifest_yaml=${manifestEncoded}`;
+  
+  p.note(
+    'Creates app with everything pre-configured:\n' +
+    '  • Socket Mode enabled\n' +
+    '  • 5 bot scopes (app_mentions:read, chat:write, im:*)\n' +
+    '  • 2 event subscriptions (app_mention, message.im)\n\n' +
+    'Just review and click "Create"!',
+    'One-Click Setup'
+  );
+  
   const openBrowser = await p.confirm({
-    message: 'Open https://api.slack.com/apps in browser?',
+    message: 'Open pre-configured app creation page?',
     initialValue: true,
   });
   
@@ -110,24 +136,20 @@ async function stepCreateApp(): Promise<boolean> {
   if (openBrowser) {
     try {
       const open = (await import('open')).default;
-      await open('https://api.slack.com/apps', { wait: false });
+      await open(url, { wait: false });
+      p.log.success('Browser opened');
     } catch {
-      p.log.warn('Could not open browser - open manually: https://api.slack.com/apps');
+      p.log.warn('Could not open browser');
+      p.log.info('Copy this URL:');
+      console.log(url);
     }
+  } else {
+    p.log.info('Copy this URL:');
+    console.log(url);
   }
   
-  // Show instructions in a note box
-  p.note(
-    '1. Click "Create New App"\n' +
-    '2. Choose "From scratch"\n' +
-    '3. App Name: "LettaBot" (or custom name)\n' +
-    '4. Select your workspace\n' +
-    '5. Click "Create App"',
-    'Instructions'
-  );
-  
   const completed = await p.confirm({
-    message: 'Created app?',
+    message: 'Clicked "Create"?',
     initialValue: true,
   });
   
@@ -140,16 +162,14 @@ async function stepCreateApp(): Promise<boolean> {
 }
 
 async function stepEnableSocketMode(existingToken?: string): Promise<string | null> {
-  p.log.step('Step 2/6: Enable Socket Mode');
+  p.log.step('Step 3/3: Get App-Level Token');
   
   p.note(
     '1. In the left sidebar, click "Socket Mode"\n' +
-    '2. Toggle "Enable Socket Mode" → ON\n' +
-    '3. You\'ll be prompted to create an App-Level Token:\n' +
+    '2. Click "Generate Token"\n' +
     '   • Token Name: "socket-token"\n' +
-    '   • Scopes: Add "connections:write"\n' +
-    '   • Click "Generate"\n' +
-    '4. Copy the token (starts with xapp-)',
+    '   • Scopes: connections:write (pre-selected)\n' +
+    '3. Copy the token (xapp-...)',
     'Instructions'
   );
   
