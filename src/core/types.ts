@@ -45,6 +45,21 @@ export interface TriggerContext {
 
 export type ChannelId = 'telegram' | 'slack' | 'whatsapp' | 'signal' | 'discord';
 
+export interface InboundAttachment {
+  id?: string;
+  name?: string;
+  mimeType?: string;
+  size?: number;
+  url?: string;
+  localPath?: string;
+  kind?: 'image' | 'file' | 'audio' | 'video';
+}
+
+export interface InboundReaction {
+  emoji: string;
+  messageId: string;
+  action?: 'added' | 'removed';
+}
 /**
  * Inbound message from any channel
  */
@@ -60,6 +75,8 @@ export interface InboundMessage {
   threadId?: string;      // Slack thread_ts
   isGroup?: boolean;      // Is this from a group chat?
   groupName?: string;     // Group/channel name if applicable
+  attachments?: InboundAttachment[];
+  reaction?: InboundReaction;
 }
 
 /**
