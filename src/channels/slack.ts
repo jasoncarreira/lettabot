@@ -5,7 +5,7 @@
  */
 
 import type { ChannelAdapter } from './types.js';
-import type { InboundMessage, OutboundMessage } from '../core/types.js';
+import type { InboundMessage, InboundReaction, OutboundMessage } from '../core/types.js';
 
 // Dynamic import to avoid requiring Slack deps if not used
 let App: typeof import('@slack/bolt').App;
@@ -142,6 +142,14 @@ export class SlackAdapter implements ChannelAdapter {
         });
       }
     });
+
+    this.app.event('reaction_added', async ({ event }) => {
+      await this.handleReactionEvent(event as SlackReactionEvent, 'added');
+    });
+
+    this.app.event('reaction_removed', async ({ event }) => {
+      await this.handleReactionEvent(event as SlackReactionEvent, 'removed');
+    });
     
     console.log('[Slack] Connecting via Socket Mode...');
     await this.app.start();
@@ -185,4 +193,56 @@ export class SlackAdapter implements ChannelAdapter {
     // Slack doesn't have a typing indicator API for bots
     // This is a no-op
   }
+
+  private async handleReactionEvent(
+    event: SlackReactionEvent,
+    action: InboundReaction['action']
+  ): Promise<void> {
+    const userId = event.user || '';
+    if (!userId) return;
+
+    if (this.config.allowedUsers && this.config.allowedUsers.length > 0) {
+      if (!this.config.allowedUsers.includes(userId)) {
+        return;
+      }
+    }
+
+    const channelId = event.item?.channel;
+    const messageId = event.item?.ts;
+    if (!channelId || !messageId) return;
+
+    const emoji = event.reaction ? `:${event.reaction}:` : '';
+    if (!emoji) return;
+
+    const isGroup = !channelId.startsWith('D');
+    const eventTs = Number(event.event_ts);
+    const timestamp = Number.isFinite(eventTs) ? new Date(eventTs * 1000) : new Date();
+
+    await this.onMessage?.({
+      channel: 'slack',
+      chatId: channelId,
+      userId,
+      userHandle: userId,
+      messageId,
+      text: '',
+      timestamp,
+      isGroup,
+      groupName: isGroup ? channelId : undefined,
+      reaction: {
+        emoji,
+        messageId,
+        action,
+      },
+    });
+  }
 }
+
+type SlackReactionEvent = {
+  user?: string;
+  reaction?: string;
+  item?: {
+    channel?: string;
+    ts?: string;
+  };
+  event_ts?: string;
+};

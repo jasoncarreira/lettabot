@@ -140,6 +140,13 @@ function formatTimestamp(date: Date, options: EnvelopeOptions): string {
   return parts.join(', ');
 }
 
+function formatReaction(msg: InboundMessage): string {
+  if (!msg.reaction) return '';
+  const action = msg.reaction.action || 'added';
+  const emoji = msg.reaction.emoji;
+  const target = msg.reaction.messageId;
+  return `Reaction: ${action} ${emoji} (msg:${target})`;
+}
 /**
  * Format a message with metadata envelope
  * 
@@ -191,6 +198,9 @@ export function formatMessageEnvelope(
   // Add format hint so agent knows what formatting syntax to use
   const formatHint = CHANNEL_FORMATS[msg.channel];
   const hint = formatHint ? `\n(Format: ${formatHint})` : '';
-  
-  return `${envelope} ${msg.text}${hint}`;
+  const reactionBlock = formatReaction(msg);
+  const bodyParts = [msg.text, reactionBlock].filter((part) => part && part.trim());
+  const body = bodyParts.join('\n');
+  const spacer = body ? ` ${body}` : '';
+  return `${envelope}${spacer}${hint}`;
 }
