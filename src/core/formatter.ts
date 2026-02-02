@@ -140,6 +140,34 @@ function formatTimestamp(date: Date, options: EnvelopeOptions): string {
   return parts.join(', ');
 }
 
+function formatBytes(size?: number): string | null {
+  if (!size || size < 0) return null;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function formatAttachments(msg: InboundMessage): string {
+  if (!msg.attachments || msg.attachments.length === 0) return '';
+  const lines = msg.attachments.map((attachment) => {
+    const name = attachment.name || attachment.id || 'attachment';
+    const details: string[] = [];
+    if (attachment.mimeType) details.push(attachment.mimeType);
+    const size = formatBytes(attachment.size);
+    if (size) details.push(size);
+    const detailText = details.length > 0 ? ` (${details.join(', ')})` : '';
+    if (attachment.localPath) {
+      return `- ${name}${detailText} saved to ${attachment.localPath}`;
+    }
+    if (attachment.url) {
+      return `- ${name}${detailText} ${attachment.url}`;
+    }
+    return `- ${name}${detailText}`;
+  });
+  return `Attachments:\n${lines.join('\n')}`;
+}
+
 function formatReaction(msg: InboundMessage): string {
   if (!msg.reaction) return '';
   const action = msg.reaction.action || 'added';
@@ -198,8 +226,9 @@ export function formatMessageEnvelope(
   // Add format hint so agent knows what formatting syntax to use
   const formatHint = CHANNEL_FORMATS[msg.channel];
   const hint = formatHint ? `\n(Format: ${formatHint})` : '';
+  const attachmentBlock = formatAttachments(msg);
   const reactionBlock = formatReaction(msg);
-  const bodyParts = [msg.text, reactionBlock].filter((part) => part && part.trim());
+  const bodyParts = [msg.text, reactionBlock, attachmentBlock].filter((part) => part && part.trim());
   const body = bodyParts.join('\n');
   const spacer = body ? ` ${body}` : '';
   return `${envelope}${spacer}${hint}`;
