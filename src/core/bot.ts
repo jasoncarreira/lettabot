@@ -224,7 +224,31 @@ export class LettaBot {
         }
       };
 
-      const initInfo = await withTimeout(session.initialize(), 'Session initialize');
+      let initInfo;
+      try {
+        initInfo = await withTimeout(session.initialize(), 'Session initialize');
+      } catch (error) {
+        if (usedSpecificConversation && this.store.agentId) {
+          console.warn('[Bot] Conversation missing, creating a new conversation...');
+          session.close();
+          session = createSession(this.store.agentId, baseOptions);
+          initInfo = await withTimeout(session.initialize(), 'Session initialize (new conversation)');
+          usedSpecificConversation = false;
+          usedDefaultConversation = false;
+        } else if (usedDefaultConversation && this.store.agentId) {
+          console.warn('[Bot] Default conversation missing, creating a new conversation...');
+          session.close();
+          session = createSession(this.store.agentId, baseOptions);
+          initInfo = await withTimeout(session.initialize(), 'Session initialize (new conversation)');
+          usedDefaultConversation = false;
+        } else {
+          throw error;
+        }
+      }
+      if (initInfo.conversationId && initInfo.conversationId !== this.store.conversationId) {
+        this.store.conversationId = initInfo.conversationId;
+        console.log('[Bot] Saved conversation ID:', initInfo.conversationId);
+      }
 
       // Send message to agent with metadata envelope
       const formattedMessage = formatMessageEnvelope(msg);
@@ -242,6 +266,40 @@ export class LettaBot {
       let lastMsgType: string | null = null;
       let lastAssistantUuid: string | null = null;
       let sentAnyMessage = false;
+      const defaultStreamIdleMs = 60000;
+      const envStreamIdleMs = Number(process.env.LETTA_STREAM_IDLE_TIMEOUT_MS);
+      const streamIdleMs = Number.isFinite(envStreamIdleMs) && envStreamIdleMs > 0
+        ? envStreamIdleMs
+        : defaultStreamIdleMs;
+      let idleTimer: NodeJS.Timeout | null = null;
+      let streamAborted = false;
+      const streamStart = Date.now();
+      let lastStreamChunk = streamStart;
+      const streamLogIntervalMs = 10000;
+      const resetIdleTimer = () => {
+        if (!streamIdleMs) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (streamAborted) return;
+          streamAborted = true;
+          console.warn(`[Bot] Stream idle timeout after ${streamIdleMs}ms, aborting session...`);
+          session.abort().catch((err) => {
+            console.error('[Bot] Stream abort failed:', err);
+          });
+          session.close();
+        }, streamIdleMs);
+      };
+      resetIdleTimer();
+      const streamLogTimer = setInterval(() => {
+        const now = Date.now();
+        const idleMs = now - lastStreamChunk;
+        if (idleMs >= streamLogIntervalMs) {
+          console.log('[Bot] Stream waiting', {
+            elapsedMs: now - streamStart,
+            idleMs,
+          });
+        }
+      }, streamLogIntervalMs);
       
       // Helper to finalize and send current accumulated response
       const finalizeMessage = async () => {
@@ -273,6 +331,10 @@ export class LettaBot {
       try {
         for await (const streamMsg of session.stream()) {
           const msgUuid = (streamMsg as any).uuid;
+          const now = Date.now();
+          const idleMs = now - lastStreamChunk;
+          lastStreamChunk = now;
+          resetIdleTimer();
           
           // When message type changes, finalize the current message
           // This ensures different message types appear as separate bubbles
@@ -343,8 +405,14 @@ export class LettaBot {
             }
             break;
           }
+
         }
       } finally {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+        clearInterval(streamLogTimer);
         clearInterval(typingInterval);
       }
       
