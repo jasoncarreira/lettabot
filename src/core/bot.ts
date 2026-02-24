@@ -1,6 +1,6 @@
 /**
  * LettaBot Core - Handles agent communication
- * 
+ *
  * Single agent, single conversation - chat continues across all channels.
  */
 
@@ -22,7 +22,7 @@ import { parseDirectives, stripActionsBlock, type Directive } from './directives
 import { createManageTodoTool } from '../tools/todo.js';
 import { syncTodosFromTool } from '../todo/store.js';
 import { MessageHookRunner, type PreHookResult } from './hooks.js';
-import { traceAgentTurn, type TracingSpan } from '../tracing/index.js';
+import { traceAgentTurn, isPhoenixEnabled, type TracingSpan } from '../tracing/index.js';
 
 
 /**
@@ -231,7 +231,7 @@ export class LettaBot implements AgentSession {
   private channels: Map<string, ChannelAdapter> = new Map();
   private messageQueue: Array<{ msg: InboundMessage; adapter: ChannelAdapter }> = [];
   private lastUserMessageTime: Date | null = null;
-  
+
   // Callback to trigger heartbeat (set by main.ts)
   public onTriggerHeartbeat?: () => Promise<void>;
   private groupBatcher?: GroupBatcher;
@@ -260,7 +260,7 @@ export class LettaBot implements AgentSession {
     }
     return { behavior: 'allow' as const };
   };
-  
+
   constructor(config: BotConfig) {
     this.config = config;
     mkdirSync(config.workingDir, { recursive: true });
@@ -750,7 +750,7 @@ export class LettaBot implements AgentSession {
 
   /**
    * Send a message and return a deduplicated stream.
-   * 
+   *
    * Handles:
    * - Persistent session reuse (subprocess stays alive across messages)
    * - CONFLICT recovery from orphaned approvals (retry once)
@@ -863,7 +863,7 @@ export class LettaBot implements AgentSession {
     this.channels.set(adapter.id, adapter);
     console.log(`Registered channel: ${adapter.name}`);
   }
-  
+
   setGroupBatcher(batcher: GroupBatcher, intervals: Map<string, number>, instantGroupIds?: Set<string>, listeningGroupIds?: Set<string>): void {
     this.groupBatcher = batcher;
     this.groupIntervals = intervals;
@@ -969,7 +969,7 @@ export class LettaBot implements AgentSession {
   // =========================================================================
   // Start / Stop
   // =========================================================================
-  
+
   async start(): Promise<void> {
     const startPromises = Array.from(this.channels.entries()).map(async ([id, adapter]) => {
       try {
@@ -982,7 +982,7 @@ export class LettaBot implements AgentSession {
     });
     await Promise.all(startPromises);
   }
-  
+
   async stop(): Promise<void> {
     for (const adapter of this.channels.values()) {
       try {
@@ -996,20 +996,20 @@ export class LettaBot implements AgentSession {
   // =========================================================================
   // Approval recovery
   // =========================================================================
-  
+
   private async attemptRecovery(maxAttempts = 2): Promise<{ recovered: boolean; shouldReset: boolean }> {
     if (!this.store.agentId) {
       return { recovered: false, shouldReset: false };
     }
-    
+
     console.log('[Bot] Checking for pending approvals...');
-    
+
     try {
       const pendingApprovals = await getPendingApprovals(
         this.store.agentId,
         this.store.conversationId || undefined
       );
-      
+
       if (pendingApprovals.length === 0) {
         if (this.store.conversationId) {
           const convResult = await recoverOrphanedConversationApproval(
@@ -1024,16 +1024,16 @@ export class LettaBot implements AgentSession {
         this.store.resetRecoveryAttempts();
         return { recovered: false, shouldReset: false };
       }
-      
+
       const attempts = this.store.recoveryAttempts;
       if (attempts >= maxAttempts) {
         console.error(`[Bot] Recovery failed after ${attempts} attempts. Still have ${pendingApprovals.length} pending approval(s).`);
         return { recovered: false, shouldReset: true };
       }
-      
+
       console.log(`[Bot] Found ${pendingApprovals.length} pending approval(s), attempting recovery (attempt ${attempts + 1}/${maxAttempts})...`);
       this.store.incrementRecoveryAttempts();
-      
+
       for (const approval of pendingApprovals) {
         console.log(`[Bot] Rejecting approval for ${approval.toolName} (${approval.toolCallId})`);
         await rejectApproval(
@@ -1042,16 +1042,16 @@ export class LettaBot implements AgentSession {
           this.store.conversationId || undefined
         );
       }
-      
+
       const runIds = [...new Set(pendingApprovals.map(a => a.runId))];
       if (runIds.length > 0) {
         console.log(`[Bot] Cancelling ${runIds.length} active run(s)...`);
         await cancelRuns(this.store.agentId, runIds);
       }
-      
+
       console.log('[Bot] Recovery completed');
       return { recovered: true, shouldReset: false };
-      
+
     } catch (error) {
       console.error('[Bot] Recovery failed:', error);
       this.store.incrementRecoveryAttempts();
@@ -1062,7 +1062,7 @@ export class LettaBot implements AgentSession {
   // =========================================================================
   // Message queue
   // =========================================================================
-  
+
   private async handleMessage(msg: InboundMessage, adapter: ChannelAdapter): Promise<void> {
     // AskUserQuestion support: if the agent is waiting for a user answer,
     // intercept this message and resolve the pending promise instead of
@@ -1141,9 +1141,9 @@ export class LettaBot implements AgentSession {
 
   private async processQueue(): Promise<void> {
     if (this.processing || this.messageQueue.length === 0) return;
-    
+
     this.processing = true;
-    
+
     while (this.messageQueue.length > 0) {
       const { msg, adapter } = this.messageQueue.shift()!;
       try {
@@ -1152,7 +1152,7 @@ export class LettaBot implements AgentSession {
         console.error('[Queue] Error processing message:', error);
       }
     }
-    
+
     console.log('[Queue] Finished processing all messages');
     this.processing = false;
   }
@@ -1160,626 +1160,654 @@ export class LettaBot implements AgentSession {
   // =========================================================================
   // processMessage - User-facing message handling
   // =========================================================================
-  
+
   private async processMessage(msg: InboundMessage, adapter: ChannelAdapter, retried = false): Promise<void> {
-    // Track timing and last target
-    const debugTiming = !!process.env.LETTABOT_DEBUG_TIMING;
-    const t0 = debugTiming ? performance.now() : 0;
-    const lap = (label: string) => {
-      if (debugTiming) console.log(`[Timing] ${label}: ${(performance.now() - t0).toFixed(0)}ms`);
-    };
-    const suppressDelivery = isResponseDeliverySuppressed(msg);
-    const convKey = this.resolveConversationKey(msg.channel);
-    const convId = convKey === 'shared' ? this.store.conversationId : this.store.getConversationId(convKey);
-    const triggerContext: TriggerContext = {
-      type: 'user_message',
-      outputMode: suppressDelivery ? 'silent' : 'responsive',
-      sourceChannel: msg.channel,
-      sourceChatId: msg.chatId,
-      sourceUserId: msg.userId,
-    };
-    let hookMessage: SendMessage | null = null;
-    let hookResponse = '';
-    let hookDelivered = false;
-    let hookError: string | undefined;
-    let hookContextBase: Omit<MessageHookContext, 'stage' | 'message'> | null = null;
-    let postHookRan = false;
-    const runPostHookOnce = async (currentResponse: string): Promise<string> => {
-      if (postHookRan || !hookMessage || !hookContextBase) return currentResponse;
-      const override = await this.runPostMessageHook({
-        stage: 'post',
-        message: hookMessage,
-        response: currentResponse,
-        delivered: hookDelivered,
-        error: hookError,
-        ...hookContextBase,
-      });
-      postHookRan = true;
-      return override ?? currentResponse;
-    };
-    this.lastUserMessageTime = new Date();
-
-    // Skip heartbeat target update for listening mode (don't redirect heartbeats)
-    if (!suppressDelivery) {
-      this.store.lastMessageTarget = {
-        channel: msg.channel,
-        chatId: msg.chatId,
-        messageId: msg.messageId,
-        updatedAt: new Date().toISOString(),
+      // Track timing and last target
+      const debugTiming = !!process.env.LETTABOT_DEBUG_TIMING;
+      const t0 = debugTiming ? performance.now() : 0;
+      const lap = (label: string) => {
+          if (debugTiming) console.log(`[Timing] ${label}: ${(performance.now() - t0).toFixed(0)}ms`);
       };
-    }
-
-    // Fire-and-forget typing indicator so session creation starts immediately
-    if (!suppressDelivery) {
-      adapter.sendTypingIndicator(msg.chatId).catch(() => {});
-    }
-    lap('typing indicator');
-
-    // Pre-send approval recovery
-    // Only run proactive recovery when previous failures were detected.
-    // Clean-path messages skip straight to session creation (the 409 retry
-    // in runSession() still catches stuck states reactively).
-    const recovery = this.store.recoveryAttempts > 0
-      ? await this.attemptRecovery()
-      : { recovered: false, shouldReset: false };
-    lap('recovery check');
-    if (recovery.shouldReset) {
-      if (!suppressDelivery) {
-        await adapter.sendMessage({
-          chatId: msg.chatId,
-          text: `(I had trouble processing that -- the session hit a stuck state and automatic recovery failed after ${this.store.recoveryAttempts} attempt(s). Please try sending your message again. If this keeps happening, /reset will clear the conversation for this channel.)`,
-          threadId: msg.threadId,
-        });
-      }
-      return;
-    }
-
-    // Format message with metadata envelope
-    const prevTarget = this.store.lastMessageTarget;
-    const isNewChatSession = !prevTarget || prevTarget.chatId !== msg.chatId || prevTarget.channel !== msg.channel;
-    const sessionContext: SessionContextOptions | undefined = isNewChatSession ? {
-      agentId: this.store.agentId || undefined,
-      serverUrl: process.env.LETTA_BASE_URL || this.store.baseUrl || 'https://api.letta.com',
-    } : undefined;
-
-    const formattedText = msg.isBatch && msg.batchedMessages
-      ? formatGroupBatchEnvelope(msg.batchedMessages, {}, msg.isListeningMode)
-      : formatMessageEnvelope(msg, {}, sessionContext);
-    let messageToSend = await buildMultimodalMessage(formattedText, msg);
-    hookMessage = messageToSend;
-    const hookBase = {
-      ...this.buildHookContextBase(convKey, triggerContext, suppressDelivery),
-      inboundMessage: msg,
-      formattedText,
-    };
-    hookContextBase = hookBase;
-
-    // Build AskUserQuestion-aware canUseTool callback with channel context.
-    // In bypassPermissions mode, this callback is only invoked for interactive
-    // tools (AskUserQuestion, ExitPlanMode) -- normal tools are auto-approved.
-    const canUseTool: CanUseToolCallback = async (toolName, toolInput) => {
-      if (toolName === 'AskUserQuestion') {
-        const questions = (toolInput.questions || []) as Array<{
-          question: string;
-          header: string;
-          options: Array<{ label: string; description: string }>;
-          multiSelect: boolean;
-        }>;
-        const questionText = this.formatQuestionsForChannel(questions);
-        console.log(`[Bot] AskUserQuestion: sending ${questions.length} question(s) to ${msg.channel}:${msg.chatId}`);
-        await adapter.sendMessage({ chatId: msg.chatId, text: questionText, threadId: msg.threadId });
-
-        // Wait for the user's next message (intercepted by handleMessage)
-        const answer = await new Promise<string>((resolve) => {
-          this.pendingQuestionResolver = resolve;
-        });
-        console.log(`[Bot] AskUserQuestion: received answer (${answer.length} chars)`);
-
-        // Map the user's response to each question
-        const answers: Record<string, string> = {};
-        for (const q of questions) {
-          answers[q.question] = answer;
-        }
-        return {
-          behavior: 'allow' as const,
-          updatedInput: { ...toolInput, answers },
-        };
-      }
-      // All other interactive tools: allow by default
-      return { behavior: 'allow' as const };
-    };
-
-    // Run session with tracing
-    let session: Session | null = null;
-
-    // Wrap the entire session run in a trace span
-    await traceAgentTurn(
-      {
-        input: formattedText, // Use full formatted text with envelope and hints
-        sessionId: convId || undefined,
-        userId: msg.userId,
-        channel: msg.channel,
-        agentId: this.store.agentId || undefined,
-        metadata: {
-          chatId: msg.chatId,
-          isGroup: String(!!msg.isGroup),
-          isBatch: String(!!msg.isBatch),
-        },
-      },
-      async (tracingSpan: TracingSpan) => {
-    // Run preMessage hook inside the trace span so the OTEL span is already active.
-    // getTraceId() in hooks reads trace.getActiveSpan() — it must be called within a span.
-    const hookResult = await this.runPreMessageHook({
-      stage: 'pre',
-      message: hookMessage!, // set to messageToSend just above traceAgentTurn
-      ...hookBase,
-    });
-    if (hookResult.skip) {
-      console.log('[Bot] preMessage hook requested skip — dropping message');
-      return;
-    }
-    if (hookResult.message) {
-      messageToSend = hookResult.message;
-      hookMessage = hookResult.message;
-    }
-    lap('format message');
-
-    try {
-      const run = await this.runSession(messageToSend, { retried, canUseTool, convKey });
-      lap('session send');
-      session = run.session;
-
-      // Stream response with delivery
-      let response = '';
-      let lastUpdate = 0; // Start at 0 so the first streaming edit fires immediately
-      let messageId: string | null = null;
-      let lastMsgType: string | null = null;
-      let lastAssistantUuid: string | null = null;
-      let sentAnyMessage = false;
-      let receivedAnyData = false;
-      let sawNonAssistantSinceLastUuid = false;
-      let lastErrorDetail: { message: string; stopReason: string; apiError?: Record<string, unknown> } | null = null;
-      let retryInfo: { attempt: number; maxAttempts: number; reason: string } | null = null;
-      let reasoningBuffer = '';
-      const msgTypeCounts: Record<string, number> = {};
-
-      const finalizeMessage = async () => {
-        // Parse and execute XML directives before sending
-        if (response.trim()) {
-          const { cleanText, directives } = parseDirectives(response);
-          response = cleanText;
-          if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId)) {
-            sentAnyMessage = true;
-          }
-        }
-
-        // Check for no-reply AFTER directive parsing
-        if (response.trim() === '<no-reply/>') {
-          console.log('[Bot] Agent chose not to reply (no-reply marker)');
-          sentAnyMessage = true;
-          response = '';
-          messageId = null;
-          lastUpdate = Date.now();
-          return;
-        }
-
-        if (!suppressDelivery && response.trim()) {
-          try {
-            const prefixed = this.prefixResponse(response);
-            if (messageId) {
-              await adapter.editMessage(msg.chatId, messageId, prefixed);
-            } else {
-              await adapter.sendMessage({ chatId: msg.chatId, text: prefixed, threadId: msg.threadId });
-            }
-            sentAnyMessage = true;
-          } catch {
-            if (messageId) sentAnyMessage = true;
-          }
-        }
-        response = '';
-        messageId = null;
-        lastUpdate = Date.now();
+      const suppressDelivery = isResponseDeliverySuppressed(msg);
+      const convKey = this.resolveConversationKey(msg.channel);
+      const convId = convKey === 'shared' ? this.store.conversationId : this.store.getConversationId(convKey);
+      const triggerContext: TriggerContext = {
+          type: 'user_message',
+          outputMode: suppressDelivery ? 'silent' : 'responsive',
+          sourceChannel: msg.channel,
+          sourceChatId: msg.chatId,
+          sourceUserId: msg.userId,
       };
-      
-      const typingInterval = setInterval(() => {
-        adapter.sendTypingIndicator(msg.chatId).catch(() => {});
-      }, 4000);
-      
-      try {
-        let firstChunkLogged = false;
-        for await (const streamMsg of run.stream()) {
-          if (!firstChunkLogged) { lap('first stream chunk'); firstChunkLogged = true; }
-          receivedAnyData = true;
-          msgTypeCounts[streamMsg.type] = (msgTypeCounts[streamMsg.type] || 0) + 1;
-          
-          const preview = JSON.stringify(streamMsg).slice(0, 300);
-          console.log(`[Stream] type=${streamMsg.type} ${preview}`);
-          
-          // Finalize on type change (avoid double-handling when result provides full response)
-          if (lastMsgType && lastMsgType !== streamMsg.type && response.trim() && streamMsg.type !== 'result') {
-            await finalizeMessage();
-          }
-
-          // Flush reasoning buffer when type changes away from reasoning.
-          // Tracing, postReasoning hook, and optional display all fire here together.
-          if (lastMsgType === 'reasoning' && streamMsg.type !== 'reasoning' && reasoningBuffer.trim()) {
-            tracingSpan.addReasoning(reasoningBuffer);
-            if (hookMessage && hookContextBase) {
-              await this.runPostReasoningHook({
-                stage: 'postReasoning',
-                message: hookMessage,
-                reasoning: reasoningBuffer,
-                ...hookContextBase,
-              });
-            }
-            if (this.config.display?.showReasoning && !suppressDelivery) {
-              try {
-                const text = this.formatReasoningDisplay(reasoningBuffer);
-                await adapter.sendMessage({ chatId: msg.chatId, text, threadId: msg.threadId });
-                sentAnyMessage = true;
-              } catch (err) {
-                console.warn('[Bot] Failed to send reasoning display:', err instanceof Error ? err.message : err);
-              }
-            }
-            reasoningBuffer = '';
-          }
-
-          // Tool loop detection
-          const maxToolCalls = this.config.maxToolCalls ?? 100;
-          if (streamMsg.type === 'tool_call' && (msgTypeCounts['tool_call'] || 0) >= maxToolCalls) {
-            console.error(`[Bot] Agent stuck in tool loop (${msgTypeCounts['tool_call']} calls), aborting`);
-            session.abort().catch(() => {});
-            response = '(Agent got stuck in a tool loop and was stopped. Try sending your message again.)';
-            break;
-          }
-
-          if (streamMsg.type === 'tool_call') {
-            this.syncTodoToolCall(streamMsg);
-            console.log(`[Stream] >>> TOOL CALL: ${streamMsg.toolName || 'unknown'} (id: ${streamMsg.toolCallId?.slice(0, 12) || '?'})`);
-            tracingSpan.addToolCall(
-              streamMsg.toolName || 'unknown',
-              (streamMsg.toolInput || {}) as Record<string, unknown>,
-              streamMsg.toolCallId
-            );
-            sawNonAssistantSinceLastUuid = true;
-            // Display tool call in channel if configured
-            if (this.config.display?.showToolCalls && !suppressDelivery) {
-              try {
-                const text = this.formatToolCallDisplay(streamMsg);
-                await adapter.sendMessage({ chatId: msg.chatId, text, threadId: msg.threadId });
-                sentAnyMessage = true;
-              } catch (err) {
-                console.warn('[Bot] Failed to send tool call display:', err instanceof Error ? err.message : err);
-              }
-            }
-          } else if (streamMsg.type === 'tool_result') {
-            console.log(`[Stream] <<< TOOL RESULT: error=${streamMsg.isError}, len=${(streamMsg as any).content?.length || 0}`);
-            tracingSpan.addToolResult(
-              streamMsg.toolCallId || '',
-              streamMsg.content || '',
-              streamMsg.isError
-            );
-            sawNonAssistantSinceLastUuid = true;
-          } else if (streamMsg.type === 'assistant' && lastMsgType !== 'assistant') {
-            console.log(`[Bot] Generating response...`);
-          } else if (streamMsg.type === 'reasoning') {
-            if (lastMsgType !== 'reasoning') {
-              console.log(`[Bot] Reasoning...`);
-            }
-            reasoningBuffer += streamMsg.content || '';
-            sawNonAssistantSinceLastUuid = true;
-          } else if (streamMsg.type === 'error') {
-            // SDK now surfaces error detail that was previously dropped.
-            // Store for use in the user-facing error message.
-            lastErrorDetail = {
-              message: (streamMsg as any).message || 'unknown',
-              stopReason: (streamMsg as any).stopReason || 'error',
-              apiError: (streamMsg as any).apiError,
-            };
-            console.error(`[Bot] Stream error detail: ${lastErrorDetail.message} [${lastErrorDetail.stopReason}]`);
-            sawNonAssistantSinceLastUuid = true;
-          } else if (streamMsg.type === 'retry') {
-            const rm = streamMsg as any;
-            retryInfo = { attempt: rm.attempt, maxAttempts: rm.maxAttempts, reason: rm.reason };
-            console.log(`[Bot] Retrying (${rm.attempt}/${rm.maxAttempts}): ${rm.reason}`);
-            sawNonAssistantSinceLastUuid = true;
-          } else if (streamMsg.type !== 'assistant') {
-            sawNonAssistantSinceLastUuid = true;
-          }
-
-          lastMsgType = streamMsg.type;
-          
-          if (streamMsg.type === 'assistant') {
-            const msgUuid = streamMsg.uuid;
-            if (msgUuid && lastAssistantUuid && msgUuid !== lastAssistantUuid) {
-              if (response.trim()) {
-                if (!sawNonAssistantSinceLastUuid) {
-                  console.warn(`[Stream] WARNING: Assistant UUID changed (${lastAssistantUuid.slice(0, 8)} -> ${msgUuid.slice(0, 8)}) with no visible tool_call/reasoning events between them. Tool call events may have been dropped by SDK transformMessage().`);
-                }
-                await finalizeMessage();
-              }
-              // Start tracking tool/reasoning visibility for the new assistant UUID.
-              sawNonAssistantSinceLastUuid = false;
-            } else if (msgUuid && !lastAssistantUuid) {
-              // Clear any pre-assistant noise so the first UUID becomes a clean baseline.
-              sawNonAssistantSinceLastUuid = false;
-            }
-            lastAssistantUuid = msgUuid || lastAssistantUuid;
-            
-            const chunk = streamMsg.content || '';
-            response += chunk;
-            hookResponse += chunk;
-            
-            // Live-edit streaming for channels that support it
-            // Hold back streaming edits while response could still be <no-reply/> or <actions> block
-            const canEdit = adapter.supportsEditing?.() ?? true;
-            const trimmed = response.trim();
-            const mayBeHidden = '<no-reply/>'.startsWith(trimmed)
-              || '<actions>'.startsWith(trimmed)
-              || (trimmed.startsWith('<actions') && !trimmed.includes('</actions>'));
-            // Strip any completed <actions> block from the streaming text
-            const streamText = stripActionsBlock(response).trim();
-            if (canEdit && !mayBeHidden && !suppressDelivery && streamText.length > 0 && Date.now() - lastUpdate > 500) {
-              try {
-                const prefixedStream = this.prefixResponse(streamText);
-                if (messageId) {
-                  await adapter.editMessage(msg.chatId, messageId, prefixedStream);
-                } else {
-                  const result = await adapter.sendMessage({ chatId: msg.chatId, text: prefixedStream, threadId: msg.threadId });
-                  messageId = result.messageId;
-                  sentAnyMessage = true;
-                }
-              } catch (editErr) {
-                console.warn('[Bot] Streaming edit failed:', editErr instanceof Error ? editErr.message : editErr);
-              }
-              lastUpdate = Date.now();
-            }
-          }
-          
-          if (streamMsg.type === 'result') {
-            const resultText = typeof streamMsg.result === 'string' ? streamMsg.result : '';
-            if (resultText.trim().length > 0) {
-              response = resultText;
-              hookResponse = resultText;
-            }
-            const hasResponse = response.trim().length > 0;
-            const isTerminalError = streamMsg.success === false || !!streamMsg.error;
-            console.log(`[Bot] Stream result: success=${streamMsg.success}, hasResponse=${hasResponse}, resultLen=${resultText.length}`);
-            console.log(`[Bot] Stream message counts:`, msgTypeCounts);
-
-            // Record output and cost in tracing span
-            tracingSpan.setOutput(response);
-            if (typeof streamMsg.totalCostUsd === 'number') {
-              tracingSpan.setCost(streamMsg.totalCostUsd);
-            }
-            if (streamMsg.error) {
-              const detail = resultText.trim();
-              const parts = [`error=${streamMsg.error}`];
-              if (streamMsg.stopReason) parts.push(`stopReason=${streamMsg.stopReason}`);
-              if (streamMsg.durationMs !== undefined) parts.push(`duration=${streamMsg.durationMs}ms`);
-              if (streamMsg.conversationId) parts.push(`conv=${streamMsg.conversationId}`);
-              if (detail) parts.push(`detail=${detail.slice(0, 300)}`);
-              const errMsg = parts.join(', ');
-              console.error(`[Bot] Result error: ${errMsg}`);
-              tracingSpan.recordError(new Error(errMsg));
-            }
-
-            // Retry once when stream ends without any assistant text.
-            // This catches both empty-success and terminal-error runs.
-            // TODO(letta-code-sdk#31): Remove once SDK handles HITL approvals in bypassPermissions mode.
-            // Only retry if we never sent anything to the user. hasResponse tracks
-            // the current buffer, but finalizeMessage() clears it on type changes.
-            // sentAnyMessage is the authoritative "did we deliver output" flag.
-            const nothingDelivered = !hasResponse && !sentAnyMessage;
-            const shouldRetryForEmptyResult = streamMsg.success && resultText === '' && nothingDelivered;
-            const shouldRetryForErrorResult = isTerminalError && nothingDelivered;
-            if (shouldRetryForEmptyResult || shouldRetryForErrorResult) {
-              if (shouldRetryForEmptyResult) {
-                console.error(`[Bot] Warning: Agent returned empty result with no response. stopReason=${streamMsg.stopReason || 'N/A'}, conv=${streamMsg.conversationId || 'N/A'}`);
-              }
-              if (shouldRetryForErrorResult) {
-                console.error(`[Bot] Warning: Agent returned terminal error (error=${streamMsg.error}, stopReason=${streamMsg.stopReason || 'N/A'}) with no response.`);
-              }
-
-              const retryConvKey = this.resolveConversationKey(msg.channel);
-              const retryConvId = retryConvKey === 'shared'
-                ? this.store.conversationId
-                : this.store.getConversationId(retryConvKey);
-              if (!retried && this.store.agentId && retryConvId) {
-                const reason = shouldRetryForErrorResult ? 'error result' : 'empty result';
-                console.log(`[Bot] ${reason} - attempting orphaned approval recovery...`);
-                this.invalidateSession(retryConvKey);
-                session = null;
-                clearInterval(typingInterval);
-                const convResult = await recoverOrphanedConversationApproval(
-                  this.store.agentId,
-                  retryConvId
-                );
-                if (convResult.recovered) {
-                  console.log(`[Bot] Recovery succeeded (${convResult.details}), retrying message...`);
-                  // Note: the retry creates its own traceAgentTurn span (child of this one).
-                  // The current span ends without output.value set; the retry span is the meaningful one.
-                  return this.processMessage(msg, adapter, true);
-                }
-                console.warn(`[Bot] No orphaned approvals found: ${convResult.details}`);
-
-                // Some client-side approval failures do not surface as pending approvals.
-                // Retry once anyway in case the previous run terminated mid-tool cycle.
-                if (shouldRetryForErrorResult) {
-                  console.log('[Bot] Retrying once after terminal error (no orphaned approvals detected)...');
-                  // Note: the retry creates its own traceAgentTurn span (child of this one).
-                  return this.processMessage(msg, adapter, true);
-                }
-              }
-            }
-
-            if (isTerminalError && !hasResponse && !sentAnyMessage) {
-              if (lastErrorDetail) {
-                response = formatApiErrorForUser(lastErrorDetail);
-              } else {
-                const err = streamMsg.error || 'unknown error';
-                const reason = streamMsg.stopReason ? ` [${streamMsg.stopReason}]` : '';
-                response = `(Agent run failed: ${err}${reason}. Try sending your message again.)`;
-              }
-              hookResponse = response;
-            }
-            
-            break;
-          }
-        }
-      } finally {
-        clearInterval(typingInterval);
-        adapter.stopTypingIndicator?.(msg.chatId)?.catch(() => {});
-      }
-      lap('stream complete');
-      if (!hookResponse && response.trim()) {
-        hookResponse = response;
-      }
-
-      // Parse and execute XML directives (e.g. <actions><react emoji="eyes" /></actions>)
-      if (response.trim()) {
-        const { cleanText, directives } = parseDirectives(response);
-        response = cleanText;
-        if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId)) {
-          sentAnyMessage = true;
-        }
-      }
-
-      // Handle no-reply marker AFTER directive parsing
-      if (response.trim() === '<no-reply/>') {
-        sentAnyMessage = true;
-        response = '';
-      }
-
-      // Detect unsupported multimodal
-      if (Array.isArray(messageToSend) && response.includes('[Image omitted]')) {
-        console.warn('[Bot] Model does not support images -- consider a vision-capable model or features.inlineImages: false');
-      }
-
-      lap('directives done');
-
-      // Listening mode: agent processed for memory, suppress response delivery
-      if (suppressDelivery) {
-        hookResponse = response;
-        if (!postHookRan && hookMessage && hookContextBase) {
-          void this.runPostMessageHook({
-            stage: 'post',
-            message: hookMessage,
-            response: hookResponse,
-            delivered: false,
-            error: hookError,
-            ...hookContextBase,
+      let hookMessage: SendMessage | null = null;
+      let hookResponse = '';
+      let hookDelivered = false;
+      let hookError: string | undefined;
+      let hookContextBase: Omit<MessageHookContext, 'stage' | 'message'> | null = null;
+      let postHookRan = false;
+      const runPostHookOnce = async (currentResponse: string): Promise<string> => {
+          if (postHookRan || !hookMessage || !hookContextBase) return currentResponse;
+          const override = await this.runPostMessageHook({
+              stage: 'post',
+              message: hookMessage,
+              response: currentResponse,
+              delivered: hookDelivered,
+              error: hookError,
+              ...hookContextBase,
           });
           postHookRan = true;
-        }
-        console.log(`[Bot] Listening mode: processed ${msg.channel}:${msg.chatId} for memory (response suppressed)`);
-        hookDelivered = false;
-        return;
+          return override ?? currentResponse;
+      };
+      this.lastUserMessageTime = new Date();
+
+      // Skip heartbeat target update for listening mode (don't redirect heartbeats)
+      if (!suppressDelivery) {
+          this.store.lastMessageTarget = {
+              channel: msg.channel,
+              chatId: msg.chatId,
+              messageId: msg.messageId,
+              updatedAt: new Date().toISOString(),
+          };
       }
 
-      // Set hookDelivered from streaming delivery before running the post hook.
-      // For streaming channels, sentAnyMessage is already true here if the response
-      // was streamed to the user. For non-streaming, the final send happens below.
-      hookDelivered = sentAnyMessage && !suppressDelivery;
-      response = await runPostHookOnce(response);
-      hookResponse = response;
-      // Send final response
-      if (response.trim()) {
-        const prefixedFinal = this.prefixResponse(response);
-        try {
-          if (messageId) {
-            await adapter.editMessage(msg.chatId, messageId, prefixedFinal);
-          } else {
-            await adapter.sendMessage({ chatId: msg.chatId, text: prefixedFinal, threadId: msg.threadId });
-          }
-          sentAnyMessage = true;
-          this.store.resetRecoveryAttempts();
-        } catch {
-          // Edit failed -- send as new message so user isn't left with truncated text
-          try {
-            await adapter.sendMessage({ chatId: msg.chatId, text: prefixedFinal, threadId: msg.threadId });
-            sentAnyMessage = true;
-            this.store.resetRecoveryAttempts();
-          } catch (retryError) {
-            console.error('[Bot] Retry send also failed:', retryError);
-          }
-        }
-      }
-      
-      lap('message delivered');
-      // Handle no response
-      if (!sentAnyMessage) {
-        if (!receivedAnyData) {
-          console.error('[Bot] Stream received NO DATA - possible stuck state');
-          await adapter.sendMessage({ 
-            chatId: msg.chatId, 
-            text: '(No response received -- the connection may have dropped or the server may be busy. Please try again. If this persists, /reset will start a fresh conversation.)', 
-            threadId: msg.threadId 
+      // Fire-and-forget typing indicator so session creation starts immediately
+      if (!suppressDelivery) {
+          adapter.sendTypingIndicator(msg.chatId).catch(() => {
           });
-        } else {
-          const hadToolActivity = (msgTypeCounts['tool_call'] || 0) > 0 || (msgTypeCounts['tool_result'] || 0) > 0;
-          if (hadToolActivity) {
-            console.log('[Bot] Agent had tool activity but no assistant message - likely sent via tool');
-          } else {
-            await adapter.sendMessage({ 
-              chatId: msg.chatId, 
-              text: '(The agent processed your message but didn\'t produce a visible response. This can happen with certain prompts. Try rephrasing or sending again.)', 
-              threadId: msg.threadId 
-            });
+      }
+      lap('typing indicator');
+
+      // Pre-send approval recovery
+      // Only run proactive recovery when previous failures were detected.
+      // Clean-path messages skip straight to session creation (the 409 retry
+      // in runSession() still catches stuck states reactively).
+      const recovery = this.store.recoveryAttempts > 0
+          ? await this.attemptRecovery()
+          : {recovered: false, shouldReset: false};
+      lap('recovery check');
+      if (recovery.shouldReset) {
+          if (!suppressDelivery) {
+              await adapter.sendMessage({
+                  chatId: msg.chatId,
+                  text: `(I had trouble processing that -- the session hit a stuck state and automatic recovery failed after ${this.store.recoveryAttempts} attempt(s). Please try sending your message again. If this keeps happening, /reset will clear the conversation for this channel.)`,
+                  threadId: msg.threadId,
+              });
           }
-        }
+          return;
       }
 
-      hookDelivered = sentAnyMessage && !suppressDelivery;
-      
-    } catch (error) {
-      console.error('[Bot] Error processing message:', error);
-      hookError = error instanceof Error ? error.message : 'Unknown error';
-      tracingSpan.recordError(error instanceof Error ? error : new Error(String(error)));
-      try {
-        await adapter.sendMessage({
-          chatId: msg.chatId,
-          text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-          threadId: msg.threadId,
-        });
-      } catch (sendError) {
-        console.error('[Bot] Failed to send error message to channel:', sendError);
-      }
-    } finally {
-      // Session stays alive for reuse -- only invalidated on errors
-      if (!postHookRan && hookMessage && hookContextBase) {
-        if (hookContextBase.suppressDelivery) {
-          void this.runPostMessageHook({
-            stage: 'post',
-            message: hookMessage,
-            response: hookResponse,
-            delivered: hookDelivered,
-            error: hookError,
-            ...hookContextBase,
-          });
-        } else {
-          const override = await this.runPostMessageHook({
-            stage: 'post',
-            message: hookMessage,
-            response: hookResponse,
-            delivered: hookDelivered,
-            error: hookError,
-            ...hookContextBase,
-          });
-          if (override !== undefined) {
-            hookResponse = override;
+      // Format message with metadata envelope
+      const prevTarget = this.store.lastMessageTarget;
+      const isNewChatSession = !prevTarget || prevTarget.chatId !== msg.chatId || prevTarget.channel !== msg.channel;
+      const sessionContext: SessionContextOptions | undefined = isNewChatSession ? {
+          agentId: this.store.agentId || undefined,
+          serverUrl: process.env.LETTA_BASE_URL || this.store.baseUrl || 'https://api.letta.com',
+      } : undefined;
+
+      const formattedText = msg.isBatch && msg.batchedMessages
+          ? formatGroupBatchEnvelope(msg.batchedMessages, {}, msg.isListeningMode)
+          : formatMessageEnvelope(msg, {}, sessionContext);
+      let messageToSend = await buildMultimodalMessage(formattedText, msg);
+      hookMessage = messageToSend;
+      const hookBase = {
+          ...this.buildHookContextBase(convKey, triggerContext, suppressDelivery),
+          inboundMessage: msg,
+          formattedText,
+      };
+      hookContextBase = hookBase;
+
+      // Build AskUserQuestion-aware canUseTool callback with channel context.
+      // In bypassPermissions mode, this callback is only invoked for interactive
+      // tools (AskUserQuestion, ExitPlanMode) -- normal tools are auto-approved.
+      const canUseTool: CanUseToolCallback = async (toolName, toolInput) => {
+          if (toolName === 'AskUserQuestion') {
+              const questions = (toolInput.questions || []) as Array<{
+                  question: string;
+                  header: string;
+                  options: Array<{ label: string; description: string }>;
+                  multiSelect: boolean;
+              }>;
+              const questionText = this.formatQuestionsForChannel(questions);
+              console.log(`[Bot] AskUserQuestion: sending ${questions.length} question(s) to ${msg.channel}:${msg.chatId}`);
+              await adapter.sendMessage({chatId: msg.chatId, text: questionText, threadId: msg.threadId});
+
+              // Wait for the user's next message (intercepted by handleMessage)
+              const answer = await new Promise<string>((resolve) => {
+                  this.pendingQuestionResolver = resolve;
+              });
+              console.log(`[Bot] AskUserQuestion: received answer (${answer.length} chars)`);
+
+              // Map the user's response to each question
+              const answers: Record<string, string> = {};
+              for (const q of questions) {
+                  answers[q.question] = answer;
+              }
+              return {
+                  behavior: 'allow' as const,
+                  updatedInput: {...toolInput, answers},
+              };
           }
-        }
-      }
-    }
-      } // end traceAgentTurn callback
-    ); // end traceAgentTurn call
+          // All other interactive tools: allow by default
+          return {behavior: 'allow' as const};
+      };
+
+      // Run session with tracing
+      let session: Session | null = null;
+
+      // Wrap the entire session run in a trace span
+      await traceAgentTurn(
+          {
+              input: formattedText, // Use full formatted text with envelope and hints
+              sessionId: convId || undefined,
+              userId: msg.userId,
+              channel: msg.channel,
+              agentId: this.store.agentId || undefined,
+              metadata: {
+                  chatId: msg.chatId,
+                  isGroup: String(!!msg.isGroup),
+                  isBatch: String(!!msg.isBatch),
+              },
+          },
+          async (tracingSpan: TracingSpan) => {
+              // Run preMessage hook inside the trace span so the OTEL span is already active.
+              // getTraceId() in hooks reads trace.getActiveSpan() — it must be called within a span.
+              const hookResult = await this.runPreMessageHook({
+                  stage: 'pre',
+                  message: hookMessage!, // set to messageToSend just above traceAgentTurn
+                  ...hookBase,
+              });
+              if (hookResult.skip) {
+                  console.log('[Bot] preMessage hook requested skip — dropping message');
+                  return;
+              }
+              if (hookResult.message) {
+                  messageToSend = hookResult.message;
+                  hookMessage = hookResult.message;
+              }
+              lap('format message');
+
+              try {
+                  const run = await this.runSession(messageToSend, {retried, canUseTool, convKey});
+                  lap('session send');
+                  session = run.session;
+
+                  // Stream response with delivery
+                  let response = '';
+                  let lastUpdate = 0; // Start at 0 so the first streaming edit fires immediately
+                  let messageId: string | null = null;
+                  let lastMsgType: string | null = null;
+                  let lastAssistantUuid: string | null = null;
+                  let sentAnyMessage = false;
+                  let receivedAnyData = false;
+                  let sawNonAssistantSinceLastUuid = false;
+                  let lastErrorDetail: {
+                      message: string;
+                      stopReason: string;
+                      apiError?: Record<string, unknown>
+                  } | null = null;
+                  let retryInfo: { attempt: number; maxAttempts: number; reason: string } | null = null;
+                  let reasoningBuffer = '';
+                  const msgTypeCounts: Record<string, number> = {};
+
+                  const finalizeMessage = async () => {
+                      // Parse and execute XML directives before sending
+                      if (response.trim()) {
+                          const {cleanText, directives} = parseDirectives(response);
+                          response = cleanText;
+                          if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId)) {
+                              sentAnyMessage = true;
+                          }
+                      }
+
+                      // Check for no-reply AFTER directive parsing
+                      if (response.trim() === '<no-reply/>') {
+                          console.log('[Bot] Agent chose not to reply (no-reply marker)');
+                          sentAnyMessage = true;
+                          response = '';
+                          messageId = null;
+                          lastUpdate = Date.now();
+                          return;
+                      }
+
+                      if (!suppressDelivery && response.trim()) {
+                          try {
+                              const prefixed = this.prefixResponse(response);
+                              if (messageId) {
+                                  await adapter.editMessage(msg.chatId, messageId, prefixed);
+                              } else {
+                                  await adapter.sendMessage({
+                                      chatId: msg.chatId,
+                                      text: prefixed,
+                                      threadId: msg.threadId
+                                  });
+                              }
+                              sentAnyMessage = true;
+                          } catch {
+                              if (messageId) sentAnyMessage = true;
+                          }
+                      }
+                      response = '';
+                      messageId = null;
+                      lastUpdate = Date.now();
+                  };
+
+                  const typingInterval = setInterval(() => {
+                      adapter.sendTypingIndicator(msg.chatId).catch(() => {
+                      });
+                  }, 4000);
+
+                  try {
+                      let firstChunkLogged = false;
+                      for await (const streamMsg of run.stream()) {
+                          if (!firstChunkLogged) {
+                              lap('first stream chunk');
+                              firstChunkLogged = true;
+                          }
+                          receivedAnyData = true;
+                          msgTypeCounts[streamMsg.type] = (msgTypeCounts[streamMsg.type] || 0) + 1;
+
+                          const preview = JSON.stringify(streamMsg).slice(0, 300);
+                          console.log(`[Stream] type=${streamMsg.type} ${preview}`);
+
+                          // Finalize on type change (avoid double-handling when result provides full response)
+                          if (lastMsgType && lastMsgType !== streamMsg.type && response.trim() && streamMsg.type !== 'result') {
+                              await finalizeMessage();
+                          }
+
+                          // Flush reasoning buffer when type changes away from reasoning.
+                          // Tracing, postReasoning hook, and optional display all fire here together.
+                          if (lastMsgType === 'reasoning' && streamMsg.type !== 'reasoning' && reasoningBuffer.trim()) {
+                              tracingSpan.addReasoning(reasoningBuffer);
+                              if (hookMessage && hookContextBase) {
+                                  await this.runPostReasoningHook({
+                                      stage: 'postReasoning',
+                                      message: hookMessage,
+                                      reasoning: reasoningBuffer,
+                                      ...hookContextBase,
+                                  });
+                              }
+                              if (this.config.display?.showReasoning && !suppressDelivery) {
+                                  try {
+                                      const text = this.formatReasoningDisplay(reasoningBuffer);
+                                      await adapter.sendMessage({chatId: msg.chatId, text, threadId: msg.threadId});
+                                      sentAnyMessage = true;
+                                  } catch (err) {
+                                      console.warn('[Bot] Failed to send reasoning display:', err instanceof Error ? err.message : err);
+                                  }
+                              }
+                              reasoningBuffer = '';
+                          }
+
+                          // Tool loop detection
+                          const maxToolCalls = this.config.maxToolCalls ?? 100;
+                          if (streamMsg.type === 'tool_call' && (msgTypeCounts['tool_call'] || 0) >= maxToolCalls) {
+                              console.error(`[Bot] Agent stuck in tool loop (${msgTypeCounts['tool_call']} calls), aborting`);
+                              session.abort().catch(() => {
+                              });
+                              response = '(Agent got stuck in a tool loop and was stopped. Try sending your message again.)';
+                              break;
+                          }
+
+                          if (streamMsg.type === 'tool_call') {
+                              this.syncTodoToolCall(streamMsg);
+                              console.log(`[Stream] >>> TOOL CALL: ${streamMsg.toolName || 'unknown'} (id: ${streamMsg.toolCallId?.slice(0, 12) || '?'})`);
+                              tracingSpan.addToolCall(
+                                  streamMsg.toolName || 'unknown',
+                                  (streamMsg.toolInput || {}) as Record<string, unknown>,
+                                  streamMsg.toolCallId
+                              );
+                              sawNonAssistantSinceLastUuid = true;
+                              // Display tool call in channel if configured
+                              if (this.config.display?.showToolCalls && !suppressDelivery) {
+                                  try {
+                                      const text = this.formatToolCallDisplay(streamMsg);
+                                      await adapter.sendMessage({chatId: msg.chatId, text, threadId: msg.threadId});
+                                      sentAnyMessage = true;
+                                  } catch (err) {
+                                      console.warn('[Bot] Failed to send tool call display:', err instanceof Error ? err.message : err);
+                                  }
+                              }
+                          } else if (streamMsg.type === 'tool_result') {
+                              console.log(`[Stream] <<< TOOL RESULT: error=${streamMsg.isError}, len=${(streamMsg as any).content?.length || 0}`);
+                              tracingSpan.addToolResult(
+                                  streamMsg.toolCallId || '',
+                                  streamMsg.content || '',
+                                  streamMsg.isError
+                              );
+                              sawNonAssistantSinceLastUuid = true;
+                          } else if (streamMsg.type === 'assistant' && lastMsgType !== 'assistant') {
+                              console.log(`[Bot] Generating response...`);
+                          } else if (streamMsg.type === 'reasoning') {
+                              if (lastMsgType !== 'reasoning') {
+                                  console.log(`[Bot] Reasoning...`);
+                              }
+                              if (isPhoenixEnabled || this.config.display?.showReasoning) {
+                                  reasoningBuffer += streamMsg.content || '';
+                              }
+                              sawNonAssistantSinceLastUuid = true;
+                          } else if (streamMsg.type === 'error') {
+                              // SDK now surfaces error detail that was previously dropped.
+                              // Store for use in the user-facing error message.
+                              lastErrorDetail = {
+                                  message: (streamMsg as any).message || 'unknown',
+                                  stopReason: (streamMsg as any).stopReason || 'error',
+                                  apiError: (streamMsg as any).apiError,
+                              };
+                              console.error(`[Bot] Stream error detail: ${lastErrorDetail.message} [${lastErrorDetail.stopReason}]`);
+                              sawNonAssistantSinceLastUuid = true;
+                          } else if (streamMsg.type === 'retry') {
+                              const rm = streamMsg as any;
+                              retryInfo = {attempt: rm.attempt, maxAttempts: rm.maxAttempts, reason: rm.reason};
+                              console.log(`[Bot] Retrying (${rm.attempt}/${rm.maxAttempts}): ${rm.reason}`);
+                              sawNonAssistantSinceLastUuid = true;
+                          } else if (streamMsg.type !== 'assistant') {
+                              sawNonAssistantSinceLastUuid = true;
+                          }
+
+                          lastMsgType = streamMsg.type;
+
+                          if (streamMsg.type === 'assistant') {
+                              const msgUuid = streamMsg.uuid;
+                              if (msgUuid && lastAssistantUuid && msgUuid !== lastAssistantUuid) {
+                                  if (response.trim()) {
+                                      if (!sawNonAssistantSinceLastUuid) {
+                                          console.warn(`[Stream] WARNING: Assistant UUID changed (${lastAssistantUuid.slice(0, 8)} -> ${msgUuid.slice(0, 8)}) with no visible tool_call/reasoning events between them. Tool call events may have been dropped by SDK transformMessage().`);
+                                      }
+                                      await finalizeMessage();
+                                  }
+                                  // Start tracking tool/reasoning visibility for the new assistant UUID.
+                                  sawNonAssistantSinceLastUuid = false;
+                              } else if (msgUuid && !lastAssistantUuid) {
+                                  // Clear any pre-assistant noise so the first UUID becomes a clean baseline.
+                                  sawNonAssistantSinceLastUuid = false;
+                              }
+                              lastAssistantUuid = msgUuid || lastAssistantUuid;
+
+                              const chunk = streamMsg.content || '';
+                              response += chunk;
+                              hookResponse += chunk;
+
+                              // Live-edit streaming for channels that support it
+                              // Hold back streaming edits while response could still be <no-reply/> or <actions> block
+                              const canEdit = adapter.supportsEditing?.() ?? true;
+                              const trimmed = response.trim();
+                              const mayBeHidden = '<no-reply/>'.startsWith(trimmed)
+                                  || '<actions>'.startsWith(trimmed)
+                                  || (trimmed.startsWith('<actions') && !trimmed.includes('</actions>'));
+                              // Strip any completed <actions> block from the streaming text
+                              const streamText = stripActionsBlock(response).trim();
+                              if (canEdit && !mayBeHidden && !suppressDelivery && streamText.length > 0 && Date.now() - lastUpdate > 500) {
+                                  try {
+                                      const prefixedStream = this.prefixResponse(streamText);
+                                      if (messageId) {
+                                          await adapter.editMessage(msg.chatId, messageId, prefixedStream);
+                                      } else {
+                                          const result = await adapter.sendMessage({
+                                              chatId: msg.chatId,
+                                              text: prefixedStream,
+                                              threadId: msg.threadId
+                                          });
+                                          messageId = result.messageId;
+                                          sentAnyMessage = true;
+                                      }
+                                  } catch (editErr) {
+                                      console.warn('[Bot] Streaming edit failed:', editErr instanceof Error ? editErr.message : editErr);
+                                  }
+                                  lastUpdate = Date.now();
+                              }
+                          }
+
+                          if (streamMsg.type === 'result') {
+                              const resultText = typeof streamMsg.result === 'string' ? streamMsg.result : '';
+                              if (resultText.trim().length > 0) {
+                                  response = resultText;
+                                  hookResponse = resultText;
+                              }
+                              const hasResponse = response.trim().length > 0;
+                              const isTerminalError = streamMsg.success === false || !!streamMsg.error;
+                              console.log(`[Bot] Stream result: success=${streamMsg.success}, hasResponse=${hasResponse}, resultLen=${resultText.length}`);
+                              console.log(`[Bot] Stream message counts:`, msgTypeCounts);
+
+                              // Record output and cost in tracing span
+                              tracingSpan.setOutput(response);
+                              if (typeof streamMsg.totalCostUsd === 'number') {
+                                  tracingSpan.setCost(streamMsg.totalCostUsd);
+                              }
+                              if (streamMsg.error) {
+                                  const detail = resultText.trim();
+                                  const parts = [`error=${streamMsg.error}`];
+                                  if (streamMsg.stopReason) parts.push(`stopReason=${streamMsg.stopReason}`);
+                                  if (streamMsg.durationMs !== undefined) parts.push(`duration=${streamMsg.durationMs}ms`);
+                                  if (streamMsg.conversationId) parts.push(`conv=${streamMsg.conversationId}`);
+                                  if (detail) parts.push(`detail=${detail.slice(0, 300)}`);
+                                  const errMsg = parts.join(', ');
+                                  console.error(`[Bot] Result error: ${errMsg}`);
+                                  tracingSpan.recordError(new Error(errMsg));
+                              }
+
+                              // Retry once when stream ends without any assistant text.
+                              // This catches both empty-success and terminal-error runs.
+                              // TODO(letta-code-sdk#31): Remove once SDK handles HITL approvals in bypassPermissions mode.
+                              // Only retry if we never sent anything to the user. hasResponse tracks
+                              // the current buffer, but finalizeMessage() clears it on type changes.
+                              // sentAnyMessage is the authoritative "did we deliver output" flag.
+                              const nothingDelivered = !hasResponse && !sentAnyMessage;
+                              const shouldRetryForEmptyResult = streamMsg.success && resultText === '' && nothingDelivered;
+                              const shouldRetryForErrorResult = isTerminalError && nothingDelivered;
+                              if (shouldRetryForEmptyResult || shouldRetryForErrorResult) {
+                                  if (shouldRetryForEmptyResult) {
+                                      console.error(`[Bot] Warning: Agent returned empty result with no response. stopReason=${streamMsg.stopReason || 'N/A'}, conv=${streamMsg.conversationId || 'N/A'}`);
+                                  }
+                                  if (shouldRetryForErrorResult) {
+                                      console.error(`[Bot] Warning: Agent returned terminal error (error=${streamMsg.error}, stopReason=${streamMsg.stopReason || 'N/A'}) with no response.`);
+                                  }
+
+                                  const retryConvKey = this.resolveConversationKey(msg.channel);
+                                  const retryConvId = retryConvKey === 'shared'
+                                      ? this.store.conversationId
+                                      : this.store.getConversationId(retryConvKey);
+                                  if (!retried && this.store.agentId && retryConvId) {
+                                      const reason = shouldRetryForErrorResult ? 'error result' : 'empty result';
+                                      console.log(`[Bot] ${reason} - attempting orphaned approval recovery...`);
+                                      this.invalidateSession(retryConvKey);
+                                      session = null;
+                                      clearInterval(typingInterval);
+                                      const convResult = await recoverOrphanedConversationApproval(
+                                          this.store.agentId,
+                                          retryConvId
+                                      );
+                                      if (convResult.recovered) {
+                                          console.log(`[Bot] Recovery succeeded (${convResult.details}), retrying message...`);
+                                          // Note: the retry creates its own traceAgentTurn span (child of this one).
+                                          // The current span ends without output.value set; the retry span is the meaningful one.
+                                          return this.processMessage(msg, adapter, true);
+                                      }
+                                      console.warn(`[Bot] No orphaned approvals found: ${convResult.details}`);
+
+                                      // Some client-side approval failures do not surface as pending approvals.
+                                      // Retry once anyway in case the previous run terminated mid-tool cycle.
+                                      if (shouldRetryForErrorResult) {
+                                          console.log('[Bot] Retrying once after terminal error (no orphaned approvals detected)...');
+                                          // Note: the retry creates its own traceAgentTurn span (child of this one).
+                                          return this.processMessage(msg, adapter, true);
+                                      }
+                                  }
+                              }
+
+                              if (isTerminalError && !hasResponse && !sentAnyMessage) {
+                                  if (lastErrorDetail) {
+                                      response = formatApiErrorForUser(lastErrorDetail);
+                                  } else {
+                                      const err = streamMsg.error || 'unknown error';
+                                      const reason = streamMsg.stopReason ? ` [${streamMsg.stopReason}]` : '';
+                                      response = `(Agent run failed: ${err}${reason}. Try sending your message again.)`;
+                                  }
+                                  hookResponse = response;
+                              }
+
+                              break;
+                          }
+                      }
+                  } finally {
+                      clearInterval(typingInterval);
+                      adapter.stopTypingIndicator?.(msg.chatId)?.catch(() => {
+                      });
+                  }
+                  lap('stream complete');
+                  if (!hookResponse && response.trim()) {
+                      hookResponse = response;
+                  }
+
+                  // Parse and execute XML directives (e.g. <actions><react emoji="eyes" /></actions>)
+                  if (response.trim()) {
+                      const {cleanText, directives} = parseDirectives(response);
+                      response = cleanText;
+                      if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId)) {
+                          sentAnyMessage = true;
+                      }
+                  }
+
+                  // Handle no-reply marker AFTER directive parsing
+                  if (response.trim() === '<no-reply/>') {
+                      sentAnyMessage = true;
+                      response = '';
+                  }
+
+                  // Detect unsupported multimodal
+                  if (Array.isArray(messageToSend) && response.includes('[Image omitted]')) {
+                      console.warn('[Bot] Model does not support images -- consider a vision-capable model or features.inlineImages: false');
+                  }
+
+                  lap('directives done');
+
+                  // Listening mode: agent processed for memory, suppress response delivery
+                  if (suppressDelivery) {
+                      hookResponse = response;
+                      if (!postHookRan && hookMessage && hookContextBase) {
+                          void this.runPostMessageHook({
+                              stage: 'post',
+                              message: hookMessage,
+                              response: hookResponse,
+                              delivered: false,
+                              error: hookError,
+                              ...hookContextBase,
+                          });
+                          postHookRan = true;
+                      }
+                      console.log(`[Bot] Listening mode: processed ${msg.channel}:${msg.chatId} for memory (response suppressed)`);
+                      hookDelivered = false;
+                      return;
+                  }
+
+                  // Set hookDelivered from streaming delivery before running the post hook.
+                  // For streaming channels, sentAnyMessage is already true here if the response
+                  // was streamed to the user. For non-streaming, the final send happens below.
+                  hookDelivered = sentAnyMessage && !suppressDelivery;
+                  response = await runPostHookOnce(response);
+                  hookResponse = response;
+                  // Send final response
+                  if (response.trim()) {
+                      const prefixedFinal = this.prefixResponse(response);
+                      try {
+                          if (messageId) {
+                              await adapter.editMessage(msg.chatId, messageId, prefixedFinal);
+                          } else {
+                              await adapter.sendMessage({
+                                  chatId: msg.chatId,
+                                  text: prefixedFinal,
+                                  threadId: msg.threadId
+                              });
+                          }
+                          sentAnyMessage = true;
+                          this.store.resetRecoveryAttempts();
+                      } catch {
+                          // Edit failed -- send as new message so user isn't left with truncated text
+                          try {
+                              await adapter.sendMessage({
+                                  chatId: msg.chatId,
+                                  text: prefixedFinal,
+                                  threadId: msg.threadId
+                              });
+                              sentAnyMessage = true;
+                              this.store.resetRecoveryAttempts();
+                          } catch (retryError) {
+                              console.error('[Bot] Retry send also failed:', retryError);
+                          }
+                      }
+                  }
+
+                  lap('message delivered');
+                  // Handle no response
+                  if (!sentAnyMessage) {
+                      if (!receivedAnyData) {
+                          console.error('[Bot] Stream received NO DATA - possible stuck state');
+                          await adapter.sendMessage({
+                              chatId: msg.chatId,
+                              text: '(No response received -- the connection may have dropped or the server may be busy. Please try again. If this persists, /reset will start a fresh conversation.)',
+                              threadId: msg.threadId
+                          });
+                      } else {
+                          const hadToolActivity = (msgTypeCounts['tool_call'] || 0) > 0 || (msgTypeCounts['tool_result'] || 0) > 0;
+                          if (hadToolActivity) {
+                              console.log('[Bot] Agent had tool activity but no assistant message - likely sent via tool');
+                          } else {
+                              await adapter.sendMessage({
+                                  chatId: msg.chatId,
+                                  text: '(The agent processed your message but didn\'t produce a visible response. This can happen with certain prompts. Try rephrasing or sending again.)',
+                                  threadId: msg.threadId
+                              });
+                          }
+                      }
+                  }
+
+                  hookDelivered = sentAnyMessage && !suppressDelivery;
+
+              } catch (error) {
+                  console.error('[Bot] Error processing message:', error);
+                  hookError = error instanceof Error ? error.message : 'Unknown error';
+                  tracingSpan.recordError(error instanceof Error ? error : new Error(String(error)));
+                  try {
+                      await adapter.sendMessage({
+                          chatId: msg.chatId,
+                          text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                          threadId: msg.threadId,
+                      });
+                  } catch (sendError) {
+                      console.error('[Bot] Failed to send error message to channel:', sendError);
+                  }
+              } finally {
+                  // Session stays alive for reuse -- only invalidated on errors
+                  if (!postHookRan && hookMessage && hookContextBase) {
+                      if (hookContextBase.suppressDelivery) {
+                          void this.runPostMessageHook({
+                              stage: 'post',
+                              message: hookMessage,
+                              response: hookResponse,
+                              delivered: hookDelivered,
+                              error: hookError,
+                              ...hookContextBase,
+                          });
+                      } else {
+                          const override = await this.runPostMessageHook({
+                              stage: 'post',
+                              message: hookMessage,
+                              response: hookResponse,
+                              delivered: hookDelivered,
+                              error: hookError,
+                              ...hookContextBase,
+                          });
+                          if (override !== undefined) {
+                              hookResponse = override;
+                          }
+                      }
+                  }
+              }
+          })
   }
 
   // =========================================================================
   // sendToAgent - Background triggers (heartbeats, cron, webhooks)
   // =========================================================================
-  
+
   /**
    * Acquire the appropriate lock for a conversation key.
    * In per-channel mode with a dedicated key, no lock needed (parallel OK).
@@ -1969,7 +1997,7 @@ export class LettaBot implements AgentSession {
   // =========================================================================
   // Channel delivery + status
   // =========================================================================
-  
+
   async deliverToChannel(
     channelId: string,
     chatId: string,
@@ -2012,21 +2040,21 @@ export class LettaBot implements AgentSession {
       channels: Array.from(this.channels.keys()),
     };
   }
-  
+
   setAgentId(agentId: string): void {
     this.store.agentId = agentId;
     console.log(`[Bot] Agent ID set to: ${agentId}`);
   }
-  
+
   reset(): void {
     this.store.reset();
     console.log('Agent reset');
   }
-  
+
   getLastMessageTarget(): { channel: string; chatId: string } | null {
     return this.store.lastMessageTarget || null;
   }
-  
+
   getLastUserMessageTime(): Date | null {
     return this.lastUserMessageTime;
   }

@@ -121,6 +121,11 @@ export interface FormatterHints {
 
   /** Whether this channel supports file/image sending */
   supportsFiles?: boolean;
+
+  // Bluesky-specific fields (used by the Bluesky adapter)
+  isReadOnly?: boolean;
+  actionsSection?: string[];
+  skipDirectives?: boolean;
 }
 
 /**
