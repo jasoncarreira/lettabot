@@ -122,9 +122,13 @@ export interface FormatterHints {
   /** Whether this channel supports file/image sending */
   supportsFiles?: boolean;
 
-  // Bluesky-specific fields (used by the Bluesky adapter)
+  /** Whether the channel is read-only (text response won't be posted, agent must use CLI) */
   isReadOnly?: boolean;
+
+  /** Custom action hints replacing the standard Response Directives section */
   actionsSection?: string[];
+
+  /** Whether to skip the standard Response Directives section entirely */
   skipDirectives?: boolean;
 }
 
@@ -142,7 +146,7 @@ export interface InboundMessage {
   timestamp: Date;
   threadId?: string;      // Slack thread_ts
   messageType?: MessageType; // 'dm', 'group', or 'public' (defaults to 'dm')
-  isGroup?: boolean;      // DEPRECATED: Use messageType instead. True if messageType === 'group'
+  isGroup?: boolean;      // True if group chat (convenience alias for messageType === 'group')
   groupName?: string;     // Group/channel name if applicable
   serverId?: string;      // Server/guild ID (Discord only)
   wasMentioned?: boolean; // Was bot explicitly mentioned? (groups only)
@@ -152,19 +156,6 @@ export interface InboundMessage {
   isBatch?: boolean;                  // Is this a batched group message?
   batchedMessages?: InboundMessage[]; // Original individual messages (for batch formatting)
   isListeningMode?: boolean;          // Listening mode: agent processes for memory but response is suppressed
-  source?: {
-    uri?: string;
-    collection?: string;
-    cid?: string;
-    rkey?: string;
-    threadRootUri?: string;
-    threadParentUri?: string;
-    threadRootCid?: string;
-    threadParentCid?: string;
-    subjectUri?: string;
-    subjectCid?: string;
-  };
-  extraContext?: Record<string, string>; // Extra key/value pairs rendered in Chat Context header
   formatterHints?: FormatterHints;   // Channel-specific formatting hints
 }
 

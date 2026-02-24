@@ -612,11 +612,11 @@ Environment variables:
   DISCORD_BOT_TOKEN       Required for Discord
   SIGNAL_PHONE_NUMBER     Required for Signal (text only, no files)
   LETTABOT_API_KEY        Override API key (auto-read from lettabot-api.json if not set)
-  LETTABOT_API_URL        API server URL (default: http://localhost:8080)
-  SIGNAL_CLI_REST_API_URL Signal daemon URL (default: http://127.0.0.1:8090)
   BLUESKY_HANDLE          Required for Bluesky posts
   BLUESKY_APP_PASSWORD    Required for Bluesky posts
   BLUESKY_SERVICE_URL     Optional override (default https://bsky.social)
+  LETTABOT_API_URL        API server URL (default: http://localhost:8080)
+  SIGNAL_CLI_REST_API_URL Signal daemon URL (default: http://127.0.0.1:8090)
   LETTABOT_AGENT_NAME     Agent name for CLI hook context
   LETTABOT_AGENT_ID       Agent ID for CLI hook context
   LETTA_AGENT_NAME        Alternate agent name env

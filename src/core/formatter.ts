@@ -236,7 +236,6 @@ function buildMetadataLines(msg: InboundMessage, options: EnvelopeOptions): stri
 function buildChatContextLines(msg: InboundMessage, options: EnvelopeOptions): string[] {
   const lines: string[] = [];
 
-  // Determine message type, defaulting to 'dm'
   const messageType = msg.messageType ?? (msg.isGroup ? 'group' : 'dm');
 
   if (messageType === 'group') {
@@ -284,9 +283,10 @@ function buildChatContextLines(msg: InboundMessage, options: EnvelopeOptions): s
     lines.push(...attachmentLines);
   }
 
-  // Extra channel-specific context (key/value pairs)
-  if (msg.extraContext) {
-    for (const [key, value] of Object.entries(msg.extraContext)) {
+  // Channel-specific display context (e.g. Bluesky operation/URI metadata)
+  const extraContext = (msg as { extraContext?: Record<string, string> }).extraContext;
+  if (extraContext) {
+    for (const [key, value] of Object.entries(extraContext)) {
       lines.push(`- **${key}**: ${value}`);
     }
   }
@@ -415,9 +415,16 @@ export function formatMessageEnvelope(
     sections.push(`## Chat Context\n${contextLines.join('\n')}`);
   }
 
-  // Response directives
-  const directiveLines = buildResponseDirectives(msg);
-  sections.push(`## Response Directives\n${directiveLines.join('\n')}`);
+  // Channel-specific action hints (Bluesky: replaces standard directives)
+  if (msg.formatterHints?.actionsSection && msg.formatterHints.actionsSection.length > 0) {
+    sections.push(`## Channel Actions\n${msg.formatterHints.actionsSection.join('\n')}`);
+  }
+
+  // Response directives (skip if channel provides its own actionsSection)
+  if (!msg.formatterHints?.skipDirectives) {
+    const directiveLines = buildResponseDirectives(msg);
+    sections.push(`## Response Directives\n${directiveLines.join('\n')}`);
+  }
 
   // Build the full system-reminder block
   const reminderContent = sections.join('\n\n');
