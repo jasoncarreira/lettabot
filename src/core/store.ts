@@ -20,6 +20,9 @@ import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import type { AgentStore, LastMessageTarget } from './types.js';
 import { getDataDir } from '../utils/paths.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('Store');
 
 const DEFAULT_STORE_PATH = 'lettabot-agent.json';
 const LOCK_RETRY_MS = 25;
@@ -45,7 +48,7 @@ function sleepSync(ms: number): void {
     return;
   }
   if (!warnedAboutBusyWait) {
-    console.warn('[Store] Atomics.wait unavailable, falling back to busy-wait for lock retries');
+    log.warn('Atomics.wait unavailable, falling back to busy-wait for lock retries');
     warnedAboutBusyWait = true;
   }
   const end = Date.now() + ms;
@@ -92,7 +95,7 @@ export class Store {
       // Repair the corrupted/missing primary from backup so the next read
       // doesn't have to fall through again.
       this.persistStore(backup.data);
-      console.error(`[Store] Recovered in-memory state for ${this.agentName} from backup store.`);
+      log.error(`Recovered in-memory state for ${this.agentName} from backup store.`);
       return;
     }
 
@@ -102,7 +105,7 @@ export class Store {
     }
 
     // Keep current in-memory state if disk files exist but are unreadable.
-    console.error(`[Store] Keeping in-memory state for ${this.agentName}; on-disk store could not be read.`);
+    log.error(`Keeping in-memory state for ${this.agentName}; on-disk store could not be read.`);
   }
 
   private normalizeStore(rawData: any): ParsedStore {
@@ -137,7 +140,7 @@ export class Store {
     try {
       return this.readStoreFromPath(filePath);
     } catch (error) {
-      console.error(`[Store] Failed to read ${label} store at ${filePath}:`, error);
+      log.error(`Failed to read ${label} store at ${filePath}:`, error);
       return null;
     }
   }
@@ -153,7 +156,7 @@ export class Store {
 
     const backup = this.tryReadStore(this.backupPath, 'backup');
     if (backup) {
-      console.error(`[Store] Recovered agent store from backup: ${this.backupPath}`);
+      log.error(`Recovered agent store from backup: ${this.backupPath}`);
       this.persistStore(backup.data);
       return backup.data;
     }
@@ -222,7 +225,7 @@ export class Store {
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'ENOENT') {
-        console.error(`[Store] Failed to release lock ${this.lockPath}:`, error);
+        log.error(`Failed to release lock ${this.lockPath}:`, error);
       }
     }
   }
@@ -263,7 +266,7 @@ export class Store {
 
     const backup = this.tryReadStore(this.backupPath, 'backup');
     if (backup) {
-      console.error(`[Store] Using backup store for merge due to unreadable primary store.`);
+      log.error(`Using backup store for merge due to unreadable primary store.`);
       return backup.data;
     }
 
@@ -274,7 +277,7 @@ export class Store {
     try {
       this.withLock(() => this.writeStoreFiles(data));
     } catch (error) {
-      console.error('Failed to persist agent store:', error);
+      log.error('Failed to persist agent store:', error);
     }
   }
 
@@ -287,7 +290,7 @@ export class Store {
         this.data = current;
       });
     } catch (error) {
-      console.error('Failed to save agent store:', error);
+      log.error('Failed to save agent store:', error);
     }
   }
 

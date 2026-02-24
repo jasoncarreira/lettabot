@@ -24,19 +24,28 @@ import {
 } from './config/index.js';
 import { isLettaApiUrl } from './utils/server.js';
 import { getDataDir, getWorkingDir, hasRailwayVolume } from './utils/paths.js';
+import { createLogger, setLogLevel } from './logger.js';
+
+const log = createLogger('Config');
+
 const yamlConfig = loadAppConfigOrExit();
 const mainConfigPath = resolveConfigPath();
 const configSource = existsSync(mainConfigPath) ? mainConfigPath : 'defaults + environment variables';
-console.log(`[Config] Loaded from ${configSource}`);
+log.info(`Loaded from ${configSource}`);
 if (yamlConfig.agents?.length) {
-  console.log(`[Config] Mode: ${serverModeLabel(yamlConfig.server.mode)}, Agents: ${yamlConfig.agents.map(a => a.name).join(', ')}`);
+  log.info(`Mode: ${serverModeLabel(yamlConfig.server.mode)}, Agents: ${yamlConfig.agents.map(a => a.name).join(', ')}`);
 } else {
-  console.log(`[Config] Mode: ${serverModeLabel(yamlConfig.server.mode)}, Agent: ${yamlConfig.agent.name}`);
+  log.info(`Mode: ${serverModeLabel(yamlConfig.server.mode)}, Agent: ${yamlConfig.agent.name}`);
 }
 if (yamlConfig.agent?.model) {
-  console.warn('[Config] WARNING: agent.model in lettabot.yaml is deprecated and ignored. Use `lettabot model set <handle>` instead.');
+  log.warn('WARNING: agent.model in lettabot.yaml is deprecated and ignored. Use `lettabot model set <handle>` instead.');
 }
 applyConfigToEnv(yamlConfig);
+
+// Apply configured log level (env vars take precedence -- handled inside setLogLevel)
+if (yamlConfig.server.logLevel && !process.env.LOG_LEVEL && !process.env.LETTABOT_LOG_LEVEL) {
+  setLogLevel(yamlConfig.server.logLevel);
+}
 
 // Bridge DEBUG=1 to DEBUG_SDK so SDK-level dropped wire messages are visible
 if (process.env.DEBUG === '1' && !process.env.DEBUG_SDK) {
@@ -44,7 +53,7 @@ if (process.env.DEBUG === '1' && !process.env.DEBUG_SDK) {
 }
 
 // Sync BYOK providers on startup (async, don't block)
-syncProviders(yamlConfig).catch(err => console.error('[Config] Failed to sync providers:', err));
+syncProviders(yamlConfig).catch(err => log.error('Failed to sync providers:', err));
 
 // Load agent ID from store and set as env var (SDK needs this)
 // Load agent ID from store file, or use LETTA_AGENT_ID env var as fallback
@@ -67,11 +76,11 @@ if (existsSync(STORE_PATH)) {
         const currentUrl = currentBaseUrl.replace(/\/$/, '');
         
         if (storedUrl !== currentUrl) {
-          console.warn(`\n⚠️  Server mismatch detected!`);
-          console.warn(`   Stored agent was created on: ${storedUrl}`);
-          console.warn(`   Current server: ${currentUrl}`);
-          console.warn(`   The agent ${firstAgent.agentId} may not exist on this server.`);
-          console.warn(`   Run 'lettabot onboard' to select or create an agent for this server.\n`);
+          log.warn(`⚠️  Server mismatch detected!`);
+          log.warn(`   Stored agent was created on: ${storedUrl}`);
+          log.warn(`   Current server: ${currentUrl}`);
+          log.warn(`   The agent ${firstAgent.agentId} may not exist on this server.`);
+          log.warn(`   Run 'lettabot onboard' to select or create an agent for this server.`);
         }
       }
     } else if (raw.agentId) {
@@ -83,11 +92,11 @@ if (existsSync(STORE_PATH)) {
         const currentUrl = currentBaseUrl.replace(/\/$/, '');
         
         if (storedUrl !== currentUrl) {
-          console.warn(`\n⚠️  Server mismatch detected!`);
-          console.warn(`   Stored agent was created on: ${storedUrl}`);
-          console.warn(`   Current server: ${currentUrl}`);
-          console.warn(`   The agent ${raw.agentId} may not exist on this server.`);
-          console.warn(`   Run 'lettabot onboard' to select or create an agent for this server.\n`);
+          log.warn(`⚠️  Server mismatch detected!`);
+          log.warn(`   Stored agent was created on: ${storedUrl}`);
+          log.warn(`   Current server: ${currentUrl}`);
+          log.warn(`   The agent ${raw.agentId} may not exist on this server.`);
+          log.warn(`   Run 'lettabot onboard' to select or create an agent for this server.`);
         }
       }
     }
@@ -122,7 +131,7 @@ async function refreshTokensIfNeeded(): Promise<void> {
   // Check if token needs refresh
   if (isTokenExpired(tokens) && hasRefreshToken(tokens)) {
     try {
-      console.log('[OAuth] Refreshing access token...');
+      log.info('Refreshing access token...');
       const newTokens = await refreshAccessToken(
         tokens.refreshToken!,
         tokens.deviceId,
@@ -141,10 +150,10 @@ async function refreshTokensIfNeeded(): Promise<void> {
       
       // Update env var with new token
       process.env.LETTA_API_KEY = newTokens.access_token;
-      console.log('[OAuth] Token refreshed successfully');
+      log.info('Token refreshed successfully');
     } catch (err) {
-      console.error('[OAuth] Failed to refresh token:', err instanceof Error ? err.message : err);
-      console.error('[OAuth] You may need to re-authenticate with `lettabot onboard`');
+      log.error('Failed to refresh token:', err instanceof Error ? err.message : err);
+      log.error('You may need to re-authenticate with `lettabot onboard`');
     }
   }
 }
@@ -182,7 +191,7 @@ import { agentExists, findAgentByName, ensureNoToolApprovals } from './tools/let
 const startupConfigPath = resolveConfigPath();
 const isContainerDeploy = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.FLY_APP_NAME || process.env.DOCKER_DEPLOY);
 if (!existsSync(startupConfigPath) && !isContainerDeploy) {
-  console.log(`
+  log.info(`
 No config file found. Searched locations:
   1. LETTABOT_CONFIG env var (not set)
   2. ./lettabot.yaml (project-local - recommended)
@@ -331,7 +340,7 @@ async function pruneAttachmentsDir(baseDir: string, maxAgeDays: number): Promise
 
   await walk(baseDir);
   if (deleted > 0) {
-    console.log(`[Attachments] Pruned ${deleted} file(s) older than ${maxAgeDays} days.`);
+    log.info(`Pruned ${deleted} file(s) older than ${maxAgeDays} days.`);
   }
 }
 
@@ -350,9 +359,9 @@ function createChannelsForAgent(
   const hasTelegramMtproto = !!(agentConfig.channels['telegram-mtproto'] as any)?.apiId;
 
   if (hasTelegramBot && hasTelegramMtproto) {
-    console.error(`\n  Error: Agent "${agentConfig.name}" has both telegram and telegram-mtproto configured.`);
-    console.error('  The Bot API adapter and MTProto adapter cannot run together.');
-    console.error('  Choose one: telegram (bot token) or telegram-mtproto (user account).\n');
+    log.error(`Agent "${agentConfig.name}" has both telegram and telegram-mtproto configured.`);
+    log.error('  The Bot API adapter and MTProto adapter cannot run together.');
+    log.error('Choose one: telegram (bot token) or telegram-mtproto (user account).');
     process.exit(1);
   }
 
@@ -403,8 +412,8 @@ function createChannelsForAgent(
   if (agentConfig.channels.whatsapp?.enabled) {
     const selfChatMode = agentConfig.channels.whatsapp.selfChat ?? true;
     if (!selfChatMode) {
-      console.warn('[WhatsApp] WARNING: selfChatMode is OFF - bot will respond to ALL incoming messages!');
-      console.warn('[WhatsApp] Only use this if this is a dedicated bot number, not your personal WhatsApp.');
+      log.warn('WARNING: selfChatMode is OFF - bot will respond to ALL incoming messages!');
+      log.warn('Only use this if this is a dedicated bot number, not your personal WhatsApp.');
     }
     adapters.push(new WhatsAppAdapter({
       sessionPath: agentConfig.channels.whatsapp.sessionPath || process.env.WHATSAPP_SESSION_PATH || './data/whatsapp-session',
@@ -423,8 +432,8 @@ function createChannelsForAgent(
   if (agentConfig.channels.signal?.phone) {
     const selfChatMode = agentConfig.channels.signal.selfChat ?? true;
     if (!selfChatMode) {
-      console.warn('[Signal] WARNING: selfChatMode is OFF - bot will respond to ALL incoming messages!');
-      console.warn('[Signal] Only use this if this is a dedicated bot number, not your personal Signal.');
+      log.warn('WARNING: selfChatMode is OFF - bot will respond to ALL incoming messages!');
+      log.warn('Only use this if this is a dedicated bot number, not your personal Signal.');
     }
     adapters.push(new SignalAdapter({
       phoneNumber: agentConfig.channels.signal.phone,
@@ -493,10 +502,10 @@ function createGroupBatcher(
   const { intervals, instantIds, listeningIds } = collectGroupBatchingConfig(agentConfig.channels);
 
   if (instantIds.size > 0) {
-    console.log(`[Groups] Instant groups: ${[...instantIds].join(', ')}`);
+    log.info(`Instant groups: ${[...instantIds].join(', ')}`);
   }
   if (listeningIds.size > 0) {
-    console.log(`[Groups] Listening groups: ${[...listeningIds].join(', ')}`);
+    log.info(`Listening groups: ${[...listeningIds].join(', ')}`);
   }
 
   const batcher = intervals.size > 0 ? new GroupBatcher((msg, adapter) => {
@@ -548,44 +557,44 @@ const hooksDir = dirname(mainConfigPath);
 
 // Validate LETTA_API_KEY is set for API mode (docker mode doesn't require it)
 if (!isDockerServerMode(yamlConfig.server.mode) && !process.env.LETTA_API_KEY) {
-  console.error('\n  Error: LETTA_API_KEY is required for Letta API.');
-  console.error('  Get your API key from https://app.letta.com and set it as an environment variable.');
-  console.error('  Or use docker mode: run "lettabot onboard" and select "Enter Docker server URL".\n');
+  log.error('LETTA_API_KEY is required for Letta API.');
+  log.error('  Get your API key from https://app.letta.com and set it as an environment variable.');
+  log.error('Or use docker mode: run "lettabot onboard" and select "Enter Docker server URL".');
   process.exit(1);
 }
 
 async function main() {
-  console.log('Starting LettaBot...\n');
+  log.info('Starting LettaBot...');
   
   // Log storage locations (helpful for Railway debugging)
   const dataDir = getDataDir();
   if (hasRailwayVolume()) {
-    console.log(`[Storage] Railway volume detected at ${process.env.RAILWAY_VOLUME_MOUNT_PATH}`);
+    log.info(`Railway volume detected at ${process.env.RAILWAY_VOLUME_MOUNT_PATH}`);
   }
-  console.log(`[Storage] Data directory: ${dataDir}`);
-  console.log(`[Storage] Working directory: ${globalConfig.workingDir}`);
+  log.info(`Data directory: ${dataDir}`);
+  log.info(`Working directory: ${globalConfig.workingDir}`);
   
   // Normalize config to agents array
   const agents = normalizeAgents(yamlConfig);
   const isMultiAgent = agents.length > 1;
-  console.log(`[Config] ${agents.length} agent(s) configured: ${agents.map(a => a.name).join(', ')}`);
+  log.info(`${agents.length} agent(s) configured: ${agents.map(a => a.name).join(', ')}`);
   
   // Validate at least one agent has channels
   const totalChannels = agents.reduce((sum, a) => sum + Object.keys(a.channels).length, 0);
   if (totalChannels === 0) {
-    console.error('\n  Error: No channels configured in any agent.');
-    console.error('  Configure channels in lettabot.yaml or set environment variables.\n');
+    log.error('No channels configured in any agent.');
+    log.error('Configure channels in lettabot.yaml or set environment variables.');
     process.exit(1);
   }
 
   const attachmentsDir = resolve(globalConfig.workingDir, 'attachments');
   pruneAttachmentsDir(attachmentsDir, globalConfig.attachmentsMaxAgeDays).catch((err) => {
-    console.warn('[Attachments] Prune failed:', err);
+    log.warn('Prune failed:', err);
   });
   if (globalConfig.attachmentsMaxAgeDays > 0) {
     const timer = setInterval(() => {
       pruneAttachmentsDir(attachmentsDir, globalConfig.attachmentsMaxAgeDays).catch((err) => {
-        console.warn('[Attachments] Prune failed:', err);
+        log.warn('Prune failed:', err);
       });
     }, ATTACHMENTS_PRUNE_INTERVAL_MS);
     timer.unref?.();
@@ -605,7 +614,7 @@ async function main() {
   };
   
   for (const agentConfig of agents) {
-    console.log(`\n[Setup] Configuring agent: ${agentConfig.name}`);
+    log.info(`Configuring agent: ${agentConfig.name}`);
     
     // Resolve memfs: YAML config takes precedence, then env var, then default false.
     // Default false prevents the SDK from auto-enabling memfs, which crashes on
@@ -639,13 +648,13 @@ async function main() {
     // Log memfs config (from either YAML or env var)
     if (resolvedMemfs !== undefined) {
       const source = agentConfig.features?.memfs !== undefined ? '' : ' (from LETTABOT_MEMFS env)';
-      console.log(`[Agent:${agentConfig.name}] memfs: ${resolvedMemfs ? 'enabled' : 'disabled'}${source}`);
+      log.info(`memfs: ${resolvedMemfs ? 'enabled' : 'disabled'}${source}`, { agent: agentConfig.name });
     }
 
     // Apply explicit agent ID from config (before store verification)
     let initialStatus = bot.getStatus();
     if (agentConfig.id && !initialStatus.agentId) {
-      console.log(`[Agent:${agentConfig.name}] Using configured agent ID: ${agentConfig.id}`);
+      log.info(`Using configured agent ID: ${agentConfig.id}`);
       bot.setAgentId(agentConfig.id);
       initialStatus = bot.getStatus();
     }
@@ -654,7 +663,7 @@ async function main() {
     if (initialStatus.agentId) {
       const exists = await agentExists(initialStatus.agentId);
       if (!exists) {
-        console.log(`[Agent:${agentConfig.name}] Stored agent ${initialStatus.agentId} not found on server`);
+        log.info(`Stored agent ${initialStatus.agentId} not found on server`);
         bot.reset();
         initialStatus = bot.getStatus();
       }
@@ -670,27 +679,27 @@ async function main() {
 
           const found = await findAgentByName(agentConfig.name);
           if (found) {
-            console.log(`[Agent:${agentConfig.name}] Found existing agent: ${found.id}`);
+            log.info(`Found existing agent: ${found.id}`);
             bot.setAgentId(found.id);
             initialStatus = bot.getStatus();
           }
         });
       } catch (error) {
-        console.warn(
-          `[Agent:${agentConfig.name}] Discovery lock failed:`,
+        log.warn(
+          `Discovery lock failed for ${agentConfig.name}:`,
           error instanceof Error ? error.message : error
         );
       }
     }
 
     if (!initialStatus.agentId) {
-      console.log(`[Agent:${agentConfig.name}] No agent found - will create on first message`);
+      log.info(`No agent found - will create on first message`);
     }
     
     // Disable tool approvals
     if (initialStatus.agentId) {
       ensureNoToolApprovals(initialStatus.agentId).catch(err => {
-        console.warn(`[Agent:${agentConfig.name}] Failed to check tool approvals:`, err);
+        log.warn(`Failed to check tool approvals:`, err);
       });
     }
 
@@ -784,7 +793,7 @@ async function main() {
   
   // Load/generate API key for CLI authentication
   const apiKey = loadOrGenerateApiKey();
-  console.log(`[API] Key: ${apiKey.slice(0, 8)}... (set LETTABOT_API_KEY to customize)`);
+  log.info(`Key: ${apiKey.slice(0, 8)}... (set LETTABOT_API_KEY to customize)`);
 
   // Start API server - uses gateway for delivery
   const apiPort = parseInt(process.env.PORT || '8080', 10);
@@ -818,7 +827,7 @@ async function main() {
   
   // Shutdown
   const shutdown = async () => {
-    console.log('\nShutting down...');
+    log.info('Shutting down...');
     services.groupBatchers.forEach(b => b.stop());
     services.heartbeatServices.forEach(h => h.stop());
     services.cronServices.forEach(c => c.stop());
@@ -833,6 +842,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error('Fatal error:', e);
+  log.error('Fatal error:', e);
   process.exit(1);
 });

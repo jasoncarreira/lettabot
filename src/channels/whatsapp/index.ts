@@ -76,13 +76,9 @@ import { parseCommand, HELP_TEXT } from "../../core/commands.js";
 // Node imports
 
 
-// ============================================================================
-// DEBUG MODE
-// ============================================================================
+import { createLogger } from '../../logger.js';
 
-/** Enable verbose debug logging with DEBUG_WHATSAPP=1 */
-const DEBUG_WA = process.env.DEBUG_WHATSAPP === '1';
-
+const log = createLogger('WhatsApp');
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -221,7 +217,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
         await this.onMessage?.(combined);
       },
       onError: (err) => {
-        console.error('[WhatsApp] Debouncer error:', err);
+        log.error('Debouncer error:', err);
       },
     });
 
@@ -266,7 +262,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
     // Spawn background monitor (non-blocking)
     this.reconnectState.monitorTask = this.monitorConnection().catch((error) => {
-      console.error("[WhatsApp] Monitor task failed:", error);
+      log.error("Monitor task failed:", error);
       this.running = false;
     });
 
@@ -276,7 +272,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
   async stop(): Promise<void> {
     if (!this.running) return;
 
-    console.log("[WhatsApp] Stopping...");
+    log.info("Stopping...");
 
     // Signal monitor to stop
     this.reconnectState.abortController?.abort();
@@ -294,7 +290,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
           ),
         ]);
       } catch (error) {
-        console.warn("[WhatsApp] Stop timeout, forcing cleanup");
+        log.warn("Stop timeout, forcing cleanup");
       }
     }
 
@@ -310,13 +306,13 @@ export class WhatsAppAdapter implements ChannelAdapter {
         // server-side, which destroys credentials and forces QR re-pair on restart
         this.sock.ws?.close();
       } catch (error) {
-        console.warn("[WhatsApp] Disconnect error:", error);
+        log.warn("Disconnect error:", error);
       }
       this.sock = null;
     }
 
     this.running = false;
-    console.log("[WhatsApp] Stopped");
+    log.info("Stopped");
   }
 
   isRunning(): boolean {
@@ -365,10 +361,9 @@ export class WhatsAppAdapter implements ChannelAdapter {
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         if (msg.includes("Connection closed during startup")) {
-          // Log the reason (status code) without the full stack trace
-          console.warn(`[WhatsApp] ${msg}`);
+          log.warn(msg);
         } else {
-          console.error("[WhatsApp] Socket error:", msg);
+          log.error("Socket error:", msg);
         }
         // Resolve the disconnect promise if it's still pending
         disconnectResolve!();
@@ -386,8 +381,8 @@ export class WhatsAppAdapter implements ChannelAdapter {
       // Check for persistent session failures (only warn after many attempts -- 
       // 1-3 failures on startup is normal WhatsApp reconnection cooldown)
       if (this.consecutiveNoQrFailures >= SESSION_CORRUPTION_THRESHOLD) {
-        console.warn(
-          `[WhatsApp] ${SESSION_CORRUPTION_THRESHOLD} consecutive connection failures without QR. Session may need re-pairing -- use /reset whatsapp if this persists.`
+        log.warn(
+          `${SESSION_CORRUPTION_THRESHOLD} consecutive connection failures without QR. Session may need re-pairing -- use /reset whatsapp if this persists.`
         );
         this.consecutiveNoQrFailures = 0;
       }
@@ -395,15 +390,15 @@ export class WhatsAppAdapter implements ChannelAdapter {
       // Increment and check retry limit
       this.reconnectState.attempts++;
       if (this.reconnectState.attempts >= policy.maxAttempts) {
-        console.error("[WhatsApp] Max reconnect attempts reached");
+        log.error("Max reconnect attempts reached");
         this.running = false;
         break;
       }
 
       // Exponential backoff
       const delay = computeBackoff(policy, this.reconnectState.attempts);
-      console.log(
-        `[WhatsApp] Reconnecting in ${delay}ms (attempt ${this.reconnectState.attempts}/${policy.maxAttempts})`
+      log.info(
+        `Reconnecting in ${delay}ms (attempt ${this.reconnectState.attempts}/${policy.maxAttempts})`
       );
 
       try {
@@ -413,7 +408,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       }
     }
 
-    console.log("[WhatsApp] Monitor loop exited");
+    log.info("Monitor loop exited");
     this.running = false;
   }
 
@@ -434,7 +429,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
           this.sock.ws.close();
         }
       } catch (error) {
-        console.warn("[WhatsApp] Socket cleanup warning:", error);
+        log.warn("Socket cleanup warning:", error);
       }
       this.sock = null;
     }
@@ -447,10 +442,10 @@ export class WhatsAppAdapter implements ChannelAdapter {
         { encoding: "utf-8" }
       );
       if (procs.trim()) {
-        console.warn(
+        log.warn(
           "[WhatsApp] Warning: clawdbot/moltbot is running and may compete for WhatsApp connection."
         );
-        console.warn(
+        log.warn(
           "[WhatsApp] Stop it with: launchctl unload ~/Library/LaunchAgents/com.clawdbot.gateway.plist"
         );
       }
@@ -480,6 +475,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
         // Track connection close during initial connection (silent -- logged at session clear)
         if (update.connection === "close" && !qrWasShown) {
           this.consecutiveNoQrFailures++;
+
         }
       },
     });
@@ -562,7 +558,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
       const isLoggedOut = statusCode === this.DisconnectReason?.loggedOut;
 
-      console.log(
+      log.info(
         `[WhatsApp] Connection closed (status: ${statusCode ?? "unknown"}, loggedOut: ${isLoggedOut})`
       );
 
@@ -570,7 +566,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
       if (isLoggedOut) {
         // Logged out - stop monitor completely
-        console.warn("[WhatsApp] Session logged out, stopping monitor");
+        log.warn("Session logged out, stopping monitor");
         this.running = false;
         this.reconnectState.abortController?.abort();
       }
@@ -589,10 +585,10 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
     // Only process "notify" (new message) and "append" (history)
     if (type !== "notify" && type !== "append") {
-      if (DEBUG_WA) console.log(`[WhatsApp:Debug] Skipped batch: type=${type} (not notify/append)`);
+      log.debug(`Skipped batch: type=${type} (not notify/append)`);
       return;
     }
-    if (DEBUG_WA) console.log(`[WhatsApp:Debug] Processing ${messages.length} message(s), type=${type}`);
+    log.debug(`Processing ${messages.length} message(s), type=${type}`);
 
     for (const m of messages) {
       const messageId = m.key.id || "";
@@ -600,13 +596,13 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
       // Filter out status updates and broadcast messages
       if (isStatusOrBroadcast(remoteJid)) {
-        if (DEBUG_WA) console.log(`[WhatsApp:Debug] Skipped status/broadcast: ${remoteJid}`);
+        log.debug(`Skipped status/broadcast: ${remoteJid}`);
         continue;
       }
 
       // Skip messages we sent (prevents loop in selfChatMode)
       if (this.sentMessageIds.has(messageId)) {
-        if (DEBUG_WA) console.log(`[WhatsApp:Debug] Skipped own sent message: ${messageId}`);
+        log.debug(`Skipped own sent message: ${messageId}`);
         this.sentMessageIds.delete(messageId);
         continue;
       }
@@ -633,9 +629,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
         this.config.selfChatMode || false
       );
 
-      if (DEBUG_WA) {
-        console.log(`[WhatsApp:Debug] Message: remoteJid=${remoteJid}, fromMe=${m.key.fromMe}, isSelfChat=${isSelfChat}, selfChatMode=${this.config.selfChatMode}, myJid=${this.myJid}, myNumber=${this.myNumber}`);
-      }
+      log.debug(`Message: remoteJid=${remoteJid}, fromMe=${m.key.fromMe}, isSelfChat=${isSelfChat}, selfChatMode=${this.config.selfChatMode}, myJid=${this.myJid}, myNumber=${this.myNumber}`);
 
       // Track self-chat LID for reply conversion
       if (isSelfChat && isLid(remoteJid)) {
@@ -645,7 +639,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       // Skip own messages (unless selfChatMode enabled for self-chat)
       if (m.key.fromMe) {
         if (!(this.config.selfChatMode && isSelfChat)) {
-          if (DEBUG_WA) console.log(`[WhatsApp:Debug] DROPPED: fromMe=true but not (selfChatMode && isSelfChat)`);
+          log.debug(`DROPPED: fromMe=true but not (selfChatMode && isSelfChat)`);
           continue;
         }
       }
@@ -676,14 +670,14 @@ export class WhatsAppAdapter implements ChannelAdapter {
       } catch (err) {
         // Extraction threw error (e.g., Bad MAC during session renegotiation)
         // Skip without marking as seen → WhatsApp will retry after session fix
-        if (DEBUG_WA) console.log(`[WhatsApp:Debug] DROPPED: extraction threw error:`, err);
+        log.debug(`DROPPED: extraction threw error:`, err);
         continue;
       }
 
       if (!extracted) {
         // Extraction returned null (no text, invalid format, or decryption failure)
         // Skip without marking as seen → allows retry on next attempt
-        if (DEBUG_WA) console.log(`[WhatsApp:Debug] DROPPED: extraction returned null (no text/media)`);
+        log.debug(`DROPPED: extraction returned null (no text/media)`);
         continue;
       }
 
@@ -691,7 +685,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       // Why: If we dedupe first, failed messages get marked as "seen" and are lost forever
       // With this order: Failed messages can retry after WhatsApp renegotiates the session
       if (this.dedupeCache.check(dedupeKey)) {
-        if (DEBUG_WA) console.log(`[WhatsApp:Debug] DROPPED: duplicate message ${dedupeKey}`);
+        log.debug(`DROPPED: duplicate message ${dedupeKey}`);
         continue; // Duplicate message - skip
       }
 
@@ -702,7 +696,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       // CRITICAL: Skip messages older than connection time (prevents duplicate responses on reconnect)
       const messageTimestampMs = extracted.timestamp.getTime();
       if (messageTimestampMs < this.connectedAtMs) {
-        if (DEBUG_WA) console.log(`[WhatsApp:Debug] DROPPED: old message (msgTime=${messageTimestampMs}, connectedAt=${this.connectedAtMs}, diff=${messageTimestampMs - this.connectedAtMs}ms)`);
+        log.debug(`DROPPED: old message (msgTime=${messageTimestampMs}, connectedAt=${this.connectedAtMs}, diff=${messageTimestampMs - this.connectedAtMs}ms)`);
         // This is an old message from before we connected - mark as read but don't auto-reply
         if (messageId && !isExtractedSelfChat && this.sock) {
           await sendReadReceipt(this.sock, remoteJid, messageId, m.key?.participant);
@@ -710,19 +704,19 @@ export class WhatsAppAdapter implements ChannelAdapter {
         continue;
       }
 
-      if (DEBUG_WA) console.log(`[WhatsApp:Debug] Post-extraction: from=${from}, chatId=${chatId}, isGroup=${isGroup}, isExtractedSelfChat=${isExtractedSelfChat}, body="${body.slice(0, 50)}"`);
+      log.debug(`Post-extraction: from=${from}, chatId=${chatId}, isGroup=${isGroup}, isExtractedSelfChat=${isExtractedSelfChat}, body="${body.slice(0, 50)}"`);
 
       // Check access control for DMs only (groups are open, self-chat always allowed)
       if (!isGroup && !isExtractedSelfChat) {
         // If selfChatMode is enabled, ONLY respond to self-chat messages
         if (this.config.selfChatMode) {
-          if (DEBUG_WA) console.log(`[WhatsApp:Debug] DROPPED: selfChatMode=true but isExtractedSelfChat=false (from=${from}, selfE164=${extracted.selfE164})`);
+          log.debug(`DROPPED: selfChatMode=true but isExtractedSelfChat=false (from=${from}, selfE164=${extracted.selfE164})`);
           continue; // Silently ignore all non-self messages
         }
 
         // Type safety: sock must be available for access control
         if (!this.sock) {
-          console.warn('[WhatsApp] Socket not available for access control');
+          log.warn('Socket not available for access control');
           continue;
         }
 
@@ -762,10 +756,10 @@ export class WhatsAppAdapter implements ChannelAdapter {
           );
           if (botParticipant?.lid) {
             this.myLid = botParticipant.lid;
-            console.log(`[WhatsApp] Discovered bot LID from group participants`);
+            log.info(`Discovered bot LID from group participants`);
           }
         } catch (err) {
-          console.warn('[WhatsApp] Could not fetch group metadata for LID extraction:', err);
+          log.warn('Could not fetch group metadata for LID extraction:', err);
         }
       }
 
@@ -786,10 +780,10 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
         if (!gatingResult.shouldProcess) {
           if (gatingResult.reason === 'no-groups-config' && !this.loggedNoGroupsHint) {
-            console.log(`[WhatsApp] Group messages ignored (no groups config). Add a "groups" section to your agent config to enable.`);
+            log.info(`Group messages ignored (no groups config). Add a "groups" section to your agent config to enable.`);
             this.loggedNoGroupsHint = true;
           } else if (gatingResult.reason !== 'no-groups-config') {
-            console.log(`[WhatsApp] Group message skipped: ${gatingResult.reason}`);
+            log.info(`Group message skipped: ${gatingResult.reason}`);
           }
           continue;
         }
@@ -866,7 +860,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       const THIRTY_MINUTES = 30 * 60 * 1000;
 
       if (elapsed > THIRTY_MINUTES) {
-        console.warn(
+        log.warn(
           "[WhatsApp] Watchdog: No messages in 30 minutes, forcing reconnect"
         );
         this.forceDisconnect("watchdog-timeout");
@@ -975,7 +969,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
    * Force a disconnect to trigger reconnection.
    */
   private forceDisconnect(reason: string): void {
-    console.log("[WhatsApp] Triggering disconnect:", reason);
+    log.info("Triggering disconnect:", reason);
     if (this.disconnectSignal) {
       this.disconnectSignal();
     }
@@ -1031,7 +1025,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
 
   async addReaction(_chatId: string, _messageId: string, _emoji: string): Promise<void> {
     // WhatsApp reactions via Baileys are not supported here yet
-    console.warn('[WhatsApp] addReaction not implemented -- directive skipped');
+    log.warn('addReaction not implemented -- directive skipped');
   }
 
   async sendFile(file: OutboundFile): Promise<{ messageId: string }> {

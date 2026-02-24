@@ -25,6 +25,9 @@ import { MessageHookRunner, type PreHookResult } from './hooks.js';
 import { traceAgentTurn, isPhoenixEnabled, type TracingSpan } from '../tracing/index.js';
 
 
+import { createLogger } from '../logger.js';
+
+const log = createLogger('Bot');
 /**
  * Detect if an error is a 409 CONFLICT from an orphaned approval.
  */
@@ -112,7 +115,9 @@ export function inferFileKind(filePath: string): 'image' | 'file' {
 }
 
 /**
- * Check whether a file path is inside the allowed directory.
+ * Check whether a resolved file path is inside the allowed directory.
+ * Prevents path traversal attacks in the send-file directive.
+ *
  * Uses realpath() for both the file and directory to follow symlinks,
  * preventing symlink-based escapes (e.g., data/evil -> /etc/passwd).
  * Falls back to textual resolve() when paths don't exist on disk.
@@ -167,12 +172,12 @@ async function buildMultimodalMessage(
         content.push(await imageFromURL(attachment.url));
       }
     } catch (err) {
-      console.warn(`[Bot] Failed to load image ${attachment.name || 'unknown'}: ${err instanceof Error ? err.message : err}`);
+      log.warn(`Failed to load image ${attachment.name || 'unknown'}: ${err instanceof Error ? err.message : err}`);
     }
   }
 
   if (content.length > 1) {
-    console.log(`[Bot] Sending ${content.length - 1} inline image(s) to LLM`);
+    log.info(`Sending ${content.length - 1} inline image(s) to LLM`);
   }
 
   return content.length > 1 ? content : formattedText;
@@ -285,12 +290,12 @@ export class LettaBot implements AgentSession {
     if (this.hooksConfig?.preMessage || this.hooksConfig?.postReasoning || this.hooksConfig?.postMessage) {
       const baseDir = config.hooksDir || process.cwd();
       this.hookRunner = new MessageHookRunner(baseDir);
-      console.log(`[Bot] Message hooks enabled (baseDir=${baseDir})`);
+      log.info(`Message hooks enabled (baseDir=${baseDir})`);
     }
     if (config.conversationOverrides?.length) {
       this.conversationOverrides = new Set(config.conversationOverrides.map((ch) => ch.toLowerCase()));
     }
-    console.log(`LettaBot initialized. Agent ID: ${this.store.agentId || '(new)'}`);
+    log.info(`LettaBot initialized. Agent ID: ${this.store.agentId || '(new)'}`);
   }
 
   // =========================================================================
@@ -437,10 +442,10 @@ export class LettaBot implements AgentSession {
     try {
       const summary = syncTodosFromTool(this.getTodoAgentKey(), incoming);
       if (summary.added > 0 || summary.updated > 0) {
-        console.log(`[Bot] Synced ${summary.totalIncoming} todo(s) from ${streamMsg.toolName} into heartbeat store (added=${summary.added}, updated=${summary.updated})`);
+        log.info(`Synced ${summary.totalIncoming} todo(s) from ${streamMsg.toolName} into heartbeat store (added=${summary.added}, updated=${summary.updated})`);
       }
     } catch (err) {
-      console.warn('[Bot] Failed to sync TodoWrite todos:', err instanceof Error ? err.message : err);
+      log.warn('Failed to sync TodoWrite todos:', err instanceof Error ? err.message : err);
     }
   }
 
@@ -545,16 +550,16 @@ export class LettaBot implements AgentSession {
       if (directive.type === 'react') {
         const targetId = directive.messageId || fallbackMessageId;
         if (!adapter.addReaction) {
-          console.warn(`[Bot] Directive react skipped: ${adapter.name} does not support addReaction`);
+          log.warn(`Directive react skipped: ${adapter.name} does not support addReaction`);
           continue;
         }
         if (targetId) {
           try {
             await adapter.addReaction(chatId, targetId, directive.emoji);
             acted = true;
-            console.log(`[Bot] Directive: reacted with ${directive.emoji}`);
+            log.info(`Directive: reacted with ${directive.emoji}`);
           } catch (err) {
-            console.warn('[Bot] Directive react failed:', err instanceof Error ? err.message : err);
+            log.warn('Directive react failed:', err instanceof Error ? err.message : err);
           }
         }
         continue;
@@ -562,15 +567,17 @@ export class LettaBot implements AgentSession {
 
       if (directive.type === 'send-file') {
         if (typeof adapter.sendFile !== 'function') {
-          console.warn(`[Bot] Directive send-file skipped: ${adapter.name} does not support sendFile`);
+          log.warn(`Directive send-file skipped: ${adapter.name} does not support sendFile`);
           continue;
         }
 
-        // Path sandboxing: restrict to configured directory (default: data/outbound under workingDir)
-        const allowedDir = this.config.sendFileDir || join(this.config.workingDir, 'data', 'outbound');
-        const resolvedPath = resolve(directive.path);
+        // Path sandboxing: resolve both config and directive paths relative to workingDir.
+        // This keeps behavior consistent when process.cwd differs from agent workingDir.
+        const allowedDirConfig = this.config.sendFileDir || join('data', 'outbound');
+        const allowedDir = resolve(this.config.workingDir, allowedDirConfig);
+        const resolvedPath = resolve(this.config.workingDir, directive.path);
         if (!await isPathAllowed(resolvedPath, allowedDir)) {
-          console.warn(`[Bot] Directive send-file blocked: ${directive.path} is outside allowed directory ${allowedDir}`);
+          log.warn(`Directive send-file blocked: ${directive.path} is outside allowed directory ${allowedDir}`);
           continue;
         }
 
@@ -578,20 +585,20 @@ export class LettaBot implements AgentSession {
         try {
           await access(resolvedPath, constants.R_OK);
         } catch {
-          console.warn(`[Bot] Directive send-file skipped: file not readable at ${directive.path}`);
+          log.warn(`Directive send-file skipped: file not found or not readable at ${directive.path}`);
           continue;
         }
 
-        // File size guard (default: 50MB, configurable via sendFileMaxSize)
+        // File size guard (default: 50MB)
         const maxSize = this.config.sendFileMaxSize ?? 50 * 1024 * 1024;
         try {
           const fileStat = await stat(resolvedPath);
           if (fileStat.size > maxSize) {
-            console.warn(`[Bot] Directive send-file blocked: ${directive.path} is ${fileStat.size} bytes (max: ${maxSize})`);
+            log.warn(`Directive send-file blocked: ${directive.path} is ${fileStat.size} bytes (max: ${maxSize})`);
             continue;
           }
         } catch {
-          console.warn(`[Bot] Directive send-file skipped: could not stat ${directive.path}`);
+          log.warn(`Directive send-file skipped: could not stat ${directive.path}`);
           continue;
         }
 
@@ -604,20 +611,20 @@ export class LettaBot implements AgentSession {
             threadId,
           });
           acted = true;
-          console.log(`[Bot] Directive: sent file ${resolvedPath}`);
+          log.info(`Directive: sent file ${resolvedPath}`);
 
           // Optional cleanup: delete file after successful send.
           // Only honored when sendFileCleanup is enabled in config (defense-in-depth).
           if (directive.cleanup && this.config.sendFileCleanup) {
             try {
               await unlink(resolvedPath);
-              console.warn(`[Bot] Directive: cleaned up ${resolvedPath}`);
+              log.warn(`Directive: cleaned up ${resolvedPath}`);
             } catch (cleanupErr) {
-              console.warn('[Bot] Directive send-file cleanup failed:', cleanupErr instanceof Error ? cleanupErr.message : cleanupErr);
+              log.warn('[Bot] Directive send-file cleanup failed:', cleanupErr instanceof Error ? cleanupErr.message : cleanupErr);
             }
           }
         } catch (err) {
-          console.warn('[Bot] Directive send-file failed:', err instanceof Error ? err.message : err);
+          log.warn('[Bot] Directive send-file failed:', err instanceof Error ? err.message : err);
         }
       }
     }
@@ -680,7 +687,7 @@ export class LettaBot implements AgentSession {
       session = createSession(this.store.agentId, opts);
     } else {
       // Create new agent -- persist immediately so we don't orphan it on later failures
-      console.log('[Bot] Creating new agent');
+      log.info('Creating new agent');
       const newAgentId = await createAgent({
         systemPrompt: SYSTEM_PROMPT,
         memory: loadMemoryBlocks(this.config.agentName),
@@ -688,7 +695,7 @@ export class LettaBot implements AgentSession {
       });
       const currentBaseUrl = process.env.LETTA_BASE_URL || 'https://api.letta.com';
       this.store.setAgent(newAgentId, currentBaseUrl);
-      console.log('[Bot] Saved new agent ID:', newAgentId);
+      log.info('Saved new agent ID:', newAgentId);
 
       if (this.config.agentName) {
         updateAgentName(newAgentId, this.config.agentName).catch(() => {});
@@ -699,10 +706,10 @@ export class LettaBot implements AgentSession {
     }
 
     // Initialize eagerly so the subprocess is ready before the first send()
-    console.log(`[Bot] Initializing session subprocess (key=${key})...`);
+    log.info(`Initializing session subprocess (key=${key})...`);
     try {
       await this.withSessionTimeout(session.initialize(), `Session initialize (key=${key})`);
-      console.log(`[Bot] Session subprocess ready (key=${key})`);
+      log.info(`Session subprocess ready (key=${key})`);
       this.sessions.set(key, session);
       return session;
     } catch (error) {
@@ -725,13 +732,13 @@ export class LettaBot implements AgentSession {
     if (key) {
       const session = this.sessions.get(key);
       if (session) {
-        console.log(`[Bot] Invalidating session (key=${key})`);
+        log.info(`Invalidating session (key=${key})`);
         session.close();
         this.sessions.delete(key);
       }
     } else {
       for (const [k, session] of this.sessions) {
-        console.log(`[Bot] Invalidating session (key=${k})`);
+        log.info(`Invalidating session (key=${k})`);
         session.close();
       }
       this.sessions.clear();
@@ -750,7 +757,7 @@ export class LettaBot implements AgentSession {
         await this.ensureSessionForKey('shared');
       }
     } catch (err) {
-      console.warn('[Bot] Session pre-warm failed:', err instanceof Error ? err.message : err);
+      log.warn('Session pre-warm failed:', err instanceof Error ? err.message : err);
     }
   }
 
@@ -764,18 +771,18 @@ export class LettaBot implements AgentSession {
     if (session.agentId && session.agentId !== this.store.agentId) {
       const currentBaseUrl = process.env.LETTA_BASE_URL || 'https://api.letta.com';
       this.store.setAgent(session.agentId, currentBaseUrl, session.conversationId || undefined);
-      console.log('[Bot] Agent ID updated:', session.agentId);
+      log.info('Agent ID updated:', session.agentId);
     } else if (session.conversationId) {
       // In per-channel mode, persist per-key. In shared mode, use legacy field.
       if (convKey && convKey !== 'shared') {
         const existing = this.store.getConversationId(convKey);
         if (session.conversationId !== existing) {
           this.store.setConversationId(convKey, session.conversationId);
-          console.log(`[Bot] Conversation ID updated (key=${convKey}):`, session.conversationId);
+          log.info(`Conversation ID updated (key=${convKey}):`, session.conversationId);
         }
       } else if (session.conversationId !== this.store.conversationId) {
         this.store.conversationId = session.conversationId;
-        console.log('[Bot] Conversation ID updated:', session.conversationId);
+        log.info('Conversation ID updated:', session.conversationId);
       }
     }
   }
@@ -812,17 +819,17 @@ export class LettaBot implements AgentSession {
     } catch (error) {
       // 409 CONFLICT from orphaned approval
       if (!retried && isApprovalConflictError(error) && this.store.agentId && convId) {
-        console.log('[Bot] CONFLICT detected - attempting orphaned approval recovery...');
+        log.info('CONFLICT detected - attempting orphaned approval recovery...');
         this.invalidateSession(convKey);
         const result = await recoverOrphanedConversationApproval(
           this.store.agentId,
           convId
         );
         if (result.recovered) {
-          console.log(`[Bot] Recovery succeeded (${result.details}), retrying...`);
+          log.info(`Recovery succeeded (${result.details}), retrying...`);
           return this.runSession(message, { retried: true, canUseTool, convKey });
         }
-        console.error(`[Bot] Orphaned approval recovery failed: ${result.details}`);
+        log.error(`Orphaned approval recovery failed: ${result.details}`);
         throw error;
       }
 
@@ -830,7 +837,7 @@ export class LettaBot implements AgentSession {
       // Only retry on errors that indicate missing conversation/agent, not
       // on auth, network, or protocol errors (which would just fail again).
       if (this.store.agentId && isConversationMissingError(error)) {
-        console.warn(`[Bot] Conversation not found (key=${convKey}), creating a new conversation...`);
+        log.warn(`Conversation not found (key=${convKey}), creating a new conversation...`);
         this.invalidateSession(convKey);
         if (convKey !== 'shared') {
           this.store.clearConversation(convKey);
@@ -893,7 +900,7 @@ export class LettaBot implements AgentSession {
     adapter.onMessage = (msg) => this.handleMessage(msg, adapter);
     adapter.onCommand = (cmd) => this.handleCommand(cmd, adapter.id);
     this.channels.set(adapter.id, adapter);
-    console.log(`Registered channel: ${adapter.name}`);
+    log.info(`Registered channel: ${adapter.name}`);
   }
 
   setGroupBatcher(batcher: GroupBatcher, intervals: Map<string, number>, instantGroupIds?: Set<string>, listeningGroupIds?: Set<string>): void {
@@ -905,12 +912,12 @@ export class LettaBot implements AgentSession {
     if (listeningGroupIds) {
       this.listeningGroupIds = listeningGroupIds;
     }
-    console.log('[Bot] Group batcher configured');
+    log.info('Group batcher configured');
   }
 
   processGroupBatch(msg: InboundMessage, adapter: ChannelAdapter): void {
     const count = msg.batchedMessages?.length || 0;
-    console.log(`[Bot] Group batch: ${count} messages from ${msg.channel}:${msg.chatId}`);
+    log.info(`Group batch: ${count} messages from ${msg.channel}:${msg.chatId}`);
     const effective = (count === 1 && msg.batchedMessages)
       ? msg.batchedMessages[0]
       : msg;
@@ -930,7 +937,7 @@ export class LettaBot implements AgentSession {
     } else {
       this.messageQueue.push({ msg: effective, adapter });
       if (!this.processing) {
-        this.processQueue().catch(err => console.error('[Queue] Fatal error in processQueue:', err));
+        this.processQueue().catch(err => log.error('Fatal error in processQueue:', err));
       }
     }
   }
@@ -940,7 +947,7 @@ export class LettaBot implements AgentSession {
   // =========================================================================
 
   private async handleCommand(command: string, channelId?: string): Promise<string | null> {
-    console.log(`[Command] Received: /${command}`);
+    log.info(`Received: /${command}`);
     switch (command) {
       case 'status': {
         const info = this.store.getInfo();
@@ -958,7 +965,7 @@ export class LettaBot implements AgentSession {
           return '⚠️ Heartbeat service not configured';
         }
         this.onTriggerHeartbeat().catch(err => {
-          console.error('[Heartbeat] Manual trigger failed:', err);
+          log.error('Manual trigger failed:', err);
         });
         return '⏰ Heartbeat triggered (silent mode - check server logs)';
       }
@@ -968,7 +975,7 @@ export class LettaBot implements AgentSession {
           // Per-channel mode: only clear the conversation for this channel
           this.store.clearConversation(convKey);
           this.invalidateSession(convKey);
-          console.log(`[Command] /reset - conversation cleared for ${convKey}`);
+          log.info(`/reset - conversation cleared for ${convKey}`);
           // Eagerly create the new session so we can report the conversation ID
           try {
             const session = await this.ensureSessionForKey(convKey);
@@ -983,7 +990,7 @@ export class LettaBot implements AgentSession {
         this.store.clearConversation();
         this.store.resetRecoveryAttempts();
         this.invalidateSession();
-        console.log('[Command] /reset - all conversations cleared');
+        log.info('/reset - all conversations cleared');
         try {
           const session = await this.ensureSessionForKey('shared');
           const newConvId = session.conversationId || '(pending)';
@@ -1005,11 +1012,11 @@ export class LettaBot implements AgentSession {
   async start(): Promise<void> {
     const startPromises = Array.from(this.channels.entries()).map(async ([id, adapter]) => {
       try {
-        console.log(`Starting channel: ${adapter.name}...`);
+        log.info(`Starting channel: ${adapter.name}...`);
         await adapter.start();
-        console.log(`Started channel: ${adapter.name}`);
+        log.info(`Started channel: ${adapter.name}`);
       } catch (e) {
-        console.error(`Failed to start channel ${id}:`, e);
+        log.error(`Failed to start channel ${id}:`, e);
       }
     });
     await Promise.all(startPromises);
@@ -1020,7 +1027,7 @@ export class LettaBot implements AgentSession {
       try {
         await adapter.stop();
       } catch (e) {
-        console.error(`Failed to stop channel ${adapter.id}:`, e);
+        log.error(`Failed to stop channel ${adapter.id}:`, e);
       }
     }
   }
@@ -1034,7 +1041,7 @@ export class LettaBot implements AgentSession {
       return { recovered: false, shouldReset: false };
     }
 
-    console.log('[Bot] Checking for pending approvals...');
+    log.info('Checking for pending approvals...');
 
     try {
       const pendingApprovals = await getPendingApprovals(
@@ -1049,7 +1056,7 @@ export class LettaBot implements AgentSession {
             this.store.conversationId
           );
           if (convResult.recovered) {
-            console.log(`[Bot] Conversation-level recovery succeeded: ${convResult.details}`);
+            log.info(`Conversation-level recovery succeeded: ${convResult.details}`);
             return { recovered: true, shouldReset: false };
           }
         }
@@ -1059,15 +1066,15 @@ export class LettaBot implements AgentSession {
 
       const attempts = this.store.recoveryAttempts;
       if (attempts >= maxAttempts) {
-        console.error(`[Bot] Recovery failed after ${attempts} attempts. Still have ${pendingApprovals.length} pending approval(s).`);
+        log.error(`Recovery failed after ${attempts} attempts. Still have ${pendingApprovals.length} pending approval(s).`);
         return { recovered: false, shouldReset: true };
       }
 
-      console.log(`[Bot] Found ${pendingApprovals.length} pending approval(s), attempting recovery (attempt ${attempts + 1}/${maxAttempts})...`);
+      log.info(`Found ${pendingApprovals.length} pending approval(s), attempting recovery (attempt ${attempts + 1}/${maxAttempts})...`);
       this.store.incrementRecoveryAttempts();
 
       for (const approval of pendingApprovals) {
-        console.log(`[Bot] Rejecting approval for ${approval.toolName} (${approval.toolCallId})`);
+        log.info(`Rejecting approval for ${approval.toolName} (${approval.toolCallId})`);
         await rejectApproval(
           this.store.agentId,
           { toolCallId: approval.toolCallId, reason: 'Session was interrupted - retrying request' },
@@ -1077,15 +1084,15 @@ export class LettaBot implements AgentSession {
 
       const runIds = [...new Set(pendingApprovals.map(a => a.runId))];
       if (runIds.length > 0) {
-        console.log(`[Bot] Cancelling ${runIds.length} active run(s)...`);
+        log.info(`Cancelling ${runIds.length} active run(s)...`);
         await cancelRuns(this.store.agentId, runIds);
       }
 
-      console.log('[Bot] Recovery completed');
+      log.info('Recovery completed');
       return { recovered: true, shouldReset: false };
 
     } catch (error) {
-      console.error('[Bot] Recovery failed:', error);
+      log.error('Recovery failed:', error);
       this.store.incrementRecoveryAttempts();
       return { recovered: false, shouldReset: this.store.recoveryAttempts >= maxAttempts };
     }
@@ -1102,19 +1109,19 @@ export class LettaBot implements AgentSession {
     // the stream is paused waiting for user input while the processing
     // flag blocks new messages from being handled.
     if (this.pendingQuestionResolver) {
-      console.log(`[Bot] Intercepted message as AskUserQuestion answer from ${msg.userId}`);
+      log.info(`Intercepted message as AskUserQuestion answer from ${msg.userId}`);
       this.pendingQuestionResolver(msg.text || '');
       this.pendingQuestionResolver = null;
       return;
     }
 
-    console.log(`[${msg.channel}] Message from ${msg.userId}: ${msg.text}`);
+    log.info(`Message from ${msg.userId} on ${msg.channel}: ${msg.text}`);
 
     if (msg.isGroup && this.groupBatcher) {
       const isInstant = this.instantGroupIds.has(`${msg.channel}:${msg.chatId}`)
         || (msg.serverId && this.instantGroupIds.has(`${msg.channel}:${msg.serverId}`));
       const debounceMs = isInstant ? 0 : (this.groupIntervals.get(msg.channel) ?? 5000);
-      console.log(`[Bot] Group message routed to batcher (debounce=${debounceMs}ms, mentioned=${msg.wasMentioned}, instant=${!!isInstant})`);
+      log.info(`Group message routed to batcher (debounce=${debounceMs}ms, mentioned=${msg.wasMentioned}, instant=${!!isInstant})`);
       this.groupBatcher.enqueue(msg, adapter, debounceMs);
       return;
     }
@@ -1127,7 +1134,7 @@ export class LettaBot implements AgentSession {
       // Shared mode: single global queue (existing behavior)
       this.messageQueue.push({ msg, adapter });
       if (!this.processing) {
-        this.processQueue().catch(err => console.error('[Queue] Fatal error in processQueue:', err));
+        this.processQueue().catch(err => log.error('Fatal error in processQueue:', err));
       }
     }
   }
@@ -1148,7 +1155,7 @@ export class LettaBot implements AgentSession {
 
     if (!this.processingKeys.has(key)) {
       this.processKeyedQueue(key).catch(err =>
-        console.error(`[Queue] Fatal error in processKeyedQueue(${key}):`, err)
+        log.error(`Fatal error in processKeyedQueue(${key}):`, err)
       );
     }
   }
@@ -1163,7 +1170,7 @@ export class LettaBot implements AgentSession {
       try {
         await this.processMessage(msg, adapter);
       } catch (error) {
-        console.error(`[Queue] Error processing message (key=${key}):`, error);
+        log.error(`Error processing message (key=${key}):`, error);
       }
     }
 
@@ -1181,11 +1188,11 @@ export class LettaBot implements AgentSession {
       try {
         await this.processMessage(msg, adapter);
       } catch (error) {
-        console.error('[Queue] Error processing message:', error);
+        log.error('Error processing message:', error);
       }
     }
 
-    console.log('[Queue] Finished processing all messages');
+    log.info('Finished processing all messages');
     this.processing = false;
   }
 
@@ -1198,7 +1205,7 @@ export class LettaBot implements AgentSession {
       const debugTiming = !!process.env.LETTABOT_DEBUG_TIMING;
       const t0 = debugTiming ? performance.now() : 0;
       const lap = (label: string) => {
-          if (debugTiming) console.log(`[Timing] ${label}: ${(performance.now() - t0).toFixed(0)}ms`);
+          log.debug(`${label}: ${(performance.now() - t0).toFixed(0)}ms`);
       };
       const suppressDelivery = isResponseDeliverySuppressed(msg);
       const convKey = this.resolveConversationKey(msg.channel);
@@ -1299,14 +1306,14 @@ export class LettaBot implements AgentSession {
                   multiSelect: boolean;
               }>;
               const questionText = this.formatQuestionsForChannel(questions);
-              console.log(`[Bot] AskUserQuestion: sending ${questions.length} question(s) to ${msg.channel}:${msg.chatId}`);
+              log.info(`AskUserQuestion: sending ${questions.length} question(s) to ${msg.channel}:${msg.chatId}`);
               await adapter.sendMessage({chatId: msg.chatId, text: questionText, threadId: msg.threadId});
 
               // Wait for the user's next message (intercepted by handleMessage)
               const answer = await new Promise<string>((resolve) => {
                   this.pendingQuestionResolver = resolve;
               });
-              console.log(`[Bot] AskUserQuestion: received answer (${answer.length} chars)`);
+              log.info(`AskUserQuestion: received answer (${answer.length} chars)`);
 
               // Map the user's response to each question
               const answers: Record<string, string> = {};
@@ -1348,7 +1355,7 @@ export class LettaBot implements AgentSession {
                   ...hookBase,
               });
               if (hookResult.skip) {
-                  console.log('[Bot] preMessage hook requested skip — dropping message');
+                  log.info('[Bot] preMessage hook requested skip — dropping message');
                   return;
               }
               if (hookResult.message) {
@@ -1385,14 +1392,16 @@ export class LettaBot implements AgentSession {
                       if (response.trim()) {
                           const {cleanText, directives} = parseDirectives(response);
                           response = cleanText;
-                          if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId, msg.threadId)) {
+                          if (suppressDelivery) {
+                              log.info(`Listening mode: skipped ${directives.length} directive(s)`);
+                          } else if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId, msg.threadId)) {
                               sentAnyMessage = true;
                           }
                       }
 
                       // Check for no-reply AFTER directive parsing
                       if (response.trim() === '<no-reply/>') {
-                          console.log('[Bot] Agent chose not to reply (no-reply marker)');
+                          log.info('[Bot] Agent chose not to reply (no-reply marker)');
                           sentAnyMessage = true;
                           response = '';
                           messageId = null;
@@ -1438,7 +1447,7 @@ export class LettaBot implements AgentSession {
                           msgTypeCounts[streamMsg.type] = (msgTypeCounts[streamMsg.type] || 0) + 1;
 
                           const preview = JSON.stringify(streamMsg).slice(0, 300);
-                          console.log(`[Stream] type=${streamMsg.type} ${preview}`);
+                          log.info(`type=${streamMsg.type} ${preview}`);
 
                           // Finalize on type change (avoid double-handling when result provides full response)
                           if (lastMsgType && lastMsgType !== streamMsg.type && response.trim() && streamMsg.type !== 'result') {
@@ -1463,7 +1472,7 @@ export class LettaBot implements AgentSession {
                                       await adapter.sendMessage({chatId: msg.chatId, text, threadId: msg.threadId});
                                       sentAnyMessage = true;
                                   } catch (err) {
-                                      console.warn('[Bot] Failed to send reasoning display:', err instanceof Error ? err.message : err);
+                                      log.warn('[Bot] Failed to send reasoning display:', err instanceof Error ? err.message : err);
                                   }
                               }
                               reasoningBuffer = '';
@@ -1472,7 +1481,7 @@ export class LettaBot implements AgentSession {
                           // Tool loop detection
                           const maxToolCalls = this.config.maxToolCalls ?? 100;
                           if (streamMsg.type === 'tool_call' && (msgTypeCounts['tool_call'] || 0) >= maxToolCalls) {
-                              console.error(`[Bot] Agent stuck in tool loop (${msgTypeCounts['tool_call']} calls), aborting`);
+                              log.error(`Agent stuck in tool loop (${msgTypeCounts['tool_call']} calls), aborting`);
                               session.abort().catch(() => {
                               });
                               response = '(Agent got stuck in a tool loop and was stopped. Try sending your message again.)';
@@ -1481,7 +1490,7 @@ export class LettaBot implements AgentSession {
 
                           if (streamMsg.type === 'tool_call') {
                               this.syncTodoToolCall(streamMsg);
-                              console.log(`[Stream] >>> TOOL CALL: ${streamMsg.toolName || 'unknown'} (id: ${streamMsg.toolCallId?.slice(0, 12) || '?'})`);
+                              log.info(`>>> TOOL CALL: ${streamMsg.toolName || 'unknown'} (id: ${streamMsg.toolCallId?.slice(0, 12) || '?'})`);
                               tracingSpan.addToolCall(
                                   streamMsg.toolName || 'unknown',
                                   (streamMsg.toolInput || {}) as Record<string, unknown>,
@@ -1495,11 +1504,11 @@ export class LettaBot implements AgentSession {
                                       await adapter.sendMessage({chatId: msg.chatId, text, threadId: msg.threadId});
                                       sentAnyMessage = true;
                                   } catch (err) {
-                                      console.warn('[Bot] Failed to send tool call display:', err instanceof Error ? err.message : err);
+                                      log.warn('[Bot] Failed to send tool call display:', err instanceof Error ? err.message : err);
                                   }
                               }
                           } else if (streamMsg.type === 'tool_result') {
-                              console.log(`[Stream] <<< TOOL RESULT: error=${streamMsg.isError}, len=${(streamMsg as any).content?.length || 0}`);
+                              log.info(`<<< TOOL RESULT: error=${streamMsg.isError}, len=${(streamMsg as any).content?.length || 0}`);
                               tracingSpan.addToolResult(
                                   streamMsg.toolCallId || '',
                                   streamMsg.content || '',
@@ -1507,10 +1516,10 @@ export class LettaBot implements AgentSession {
                               );
                               sawNonAssistantSinceLastUuid = true;
                           } else if (streamMsg.type === 'assistant' && lastMsgType !== 'assistant') {
-                              console.log(`[Bot] Generating response...`);
+                              log.info(`Generating response...`);
                           } else if (streamMsg.type === 'reasoning') {
                               if (lastMsgType !== 'reasoning') {
-                                  console.log(`[Bot] Reasoning...`);
+                                  log.info(`Reasoning...`);
                               }
                               if (isPhoenixEnabled || this.config.display?.showReasoning) {
                                   reasoningBuffer += streamMsg.content || '';
@@ -1524,12 +1533,12 @@ export class LettaBot implements AgentSession {
                                   stopReason: (streamMsg as any).stopReason || 'error',
                                   apiError: (streamMsg as any).apiError,
                               };
-                              console.error(`[Bot] Stream error detail: ${lastErrorDetail.message} [${lastErrorDetail.stopReason}]`);
+                              log.error(`Stream error detail: ${lastErrorDetail.message} [${lastErrorDetail.stopReason}]`);
                               sawNonAssistantSinceLastUuid = true;
                           } else if (streamMsg.type === 'retry') {
                               const rm = streamMsg as any;
                               retryInfo = {attempt: rm.attempt, maxAttempts: rm.maxAttempts, reason: rm.reason};
-                              console.log(`[Bot] Retrying (${rm.attempt}/${rm.maxAttempts}): ${rm.reason}`);
+                              log.info(`Retrying (${rm.attempt}/${rm.maxAttempts}): ${rm.reason}`);
                               sawNonAssistantSinceLastUuid = true;
                           } else if (streamMsg.type !== 'assistant') {
                               sawNonAssistantSinceLastUuid = true;
@@ -1542,7 +1551,7 @@ export class LettaBot implements AgentSession {
                               if (msgUuid && lastAssistantUuid && msgUuid !== lastAssistantUuid) {
                                   if (response.trim()) {
                                       if (!sawNonAssistantSinceLastUuid) {
-                                          console.warn(`[Stream] WARNING: Assistant UUID changed (${lastAssistantUuid.slice(0, 8)} -> ${msgUuid.slice(0, 8)}) with no visible tool_call/reasoning events between them. Tool call events may have been dropped by SDK transformMessage().`);
+                                          log.warn(`WARNING: Assistant UUID changed (${lastAssistantUuid.slice(0, 8)} -> ${msgUuid.slice(0, 8)}) with no visible tool_call/reasoning events between them. Tool call events may have been dropped by SDK transformMessage().`);
                                       }
                                       await finalizeMessage();
                                   }
@@ -1582,7 +1591,7 @@ export class LettaBot implements AgentSession {
                                           sentAnyMessage = true;
                                       }
                                   } catch (editErr) {
-                                      console.warn('[Bot] Streaming edit failed:', editErr instanceof Error ? editErr.message : editErr);
+                                      log.warn('[Bot] Streaming edit failed:', editErr instanceof Error ? editErr.message : editErr);
                                   }
                                   lastUpdate = Date.now();
                               }
@@ -1596,8 +1605,8 @@ export class LettaBot implements AgentSession {
                               }
                               const hasResponse = response.trim().length > 0;
                               const isTerminalError = streamMsg.success === false || !!streamMsg.error;
-                              console.log(`[Bot] Stream result: success=${streamMsg.success}, hasResponse=${hasResponse}, resultLen=${resultText.length}`);
-                              console.log(`[Bot] Stream message counts:`, msgTypeCounts);
+                              log.info(`Stream result: success=${streamMsg.success}, hasResponse=${hasResponse}, resultLen=${resultText.length}`);
+                              log.info(`Stream message counts:`, msgTypeCounts);
 
                               // Record output and cost in tracing span
                               tracingSpan.setOutput(response);
@@ -1612,7 +1621,7 @@ export class LettaBot implements AgentSession {
                                   if (streamMsg.conversationId) parts.push(`conv=${streamMsg.conversationId}`);
                                   if (detail) parts.push(`detail=${detail.slice(0, 300)}`);
                                   const errMsg = parts.join(', ');
-                                  console.error(`[Bot] Result error: ${errMsg}`);
+                                  log.error(`Result error: ${errMsg}`);
                                   tracingSpan.recordError(new Error(errMsg));
                               }
 
@@ -1627,10 +1636,10 @@ export class LettaBot implements AgentSession {
                               const shouldRetryForErrorResult = isTerminalError && nothingDelivered;
                               if (shouldRetryForEmptyResult || shouldRetryForErrorResult) {
                                   if (shouldRetryForEmptyResult) {
-                                      console.error(`[Bot] Warning: Agent returned empty result with no response. stopReason=${streamMsg.stopReason || 'N/A'}, conv=${streamMsg.conversationId || 'N/A'}`);
+                                      log.error(`Warning: Agent returned empty result with no response. stopReason=${streamMsg.stopReason || 'N/A'}, conv=${streamMsg.conversationId || 'N/A'}`);
                                   }
                                   if (shouldRetryForErrorResult) {
-                                      console.error(`[Bot] Warning: Agent returned terminal error (error=${streamMsg.error}, stopReason=${streamMsg.stopReason || 'N/A'}) with no response.`);
+                                      log.error(`Warning: Agent returned terminal error (error=${streamMsg.error}, stopReason=${streamMsg.stopReason || 'N/A'}) with no response.`);
                                   }
 
                                   const retryConvKey = this.resolveConversationKey(msg.channel);
@@ -1639,7 +1648,7 @@ export class LettaBot implements AgentSession {
                                       : this.store.getConversationId(retryConvKey);
                                   if (!retried && this.store.agentId && retryConvId) {
                                       const reason = shouldRetryForErrorResult ? 'error result' : 'empty result';
-                                      console.log(`[Bot] ${reason} - attempting orphaned approval recovery...`);
+                                      log.info(`${reason} - attempting orphaned approval recovery...`);
                                       this.invalidateSession(retryConvKey);
                                       session = null;
                                       clearInterval(typingInterval);
@@ -1648,17 +1657,17 @@ export class LettaBot implements AgentSession {
                                           retryConvId
                                       );
                                       if (convResult.recovered) {
-                                          console.log(`[Bot] Recovery succeeded (${convResult.details}), retrying message...`);
+                                          log.info(`Recovery succeeded (${convResult.details}), retrying message...`);
                                           // Note: the retry creates its own traceAgentTurn span (child of this one).
                                           // The current span ends without output.value set; the retry span is the meaningful one.
                                           return this.processMessage(msg, adapter, true);
                                       }
-                                      console.warn(`[Bot] No orphaned approvals found: ${convResult.details}`);
+                                      log.warn(`No orphaned approvals found: ${convResult.details}`);
 
                                       // Some client-side approval failures do not surface as pending approvals.
                                       // Retry once anyway in case the previous run terminated mid-tool cycle.
                                       if (shouldRetryForErrorResult) {
-                                          console.log('[Bot] Retrying once after terminal error (no orphaned approvals detected)...');
+                                          log.info('[Bot] Retrying once after terminal error (no orphaned approvals detected)...');
                                           // Note: the retry creates its own traceAgentTurn span (child of this one).
                                           return this.processMessage(msg, adapter, true);
                                       }
@@ -1693,7 +1702,9 @@ export class LettaBot implements AgentSession {
                   if (response.trim()) {
                       const {cleanText, directives} = parseDirectives(response);
                       response = cleanText;
-                      if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId, msg.threadId)) {
+                      if (suppressDelivery) {
+                          log.info(`Listening mode: skipped ${directives.length} directive(s)`);
+                      } else if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId, msg.threadId)) {
                           sentAnyMessage = true;
                       }
                   }
@@ -1706,7 +1717,7 @@ export class LettaBot implements AgentSession {
 
                   // Detect unsupported multimodal
                   if (Array.isArray(messageToSend) && response.includes('[Image omitted]')) {
-                      console.warn('[Bot] Model does not support images -- consider a vision-capable model or features.inlineImages: false');
+                      log.warn('[Bot] Model does not support images -- consider a vision-capable model or features.inlineImages: false');
                   }
 
                   lap('directives done');
@@ -1725,7 +1736,7 @@ export class LettaBot implements AgentSession {
                           });
                           postHookRan = true;
                       }
-                      console.log(`[Bot] Listening mode: processed ${msg.channel}:${msg.chatId} for memory (response suppressed)`);
+                      log.info(`Listening mode: processed ${msg.channel}:${msg.chatId} for memory (response suppressed)`);
                       hookDelivered = false;
                       return;
                   }
@@ -1762,7 +1773,7 @@ export class LettaBot implements AgentSession {
                               sentAnyMessage = true;
                               this.store.resetRecoveryAttempts();
                           } catch (retryError) {
-                              console.error('[Bot] Retry send also failed:', retryError);
+                              log.error('[Bot] Retry send also failed:', retryError);
                           }
                       }
                   }
@@ -1771,7 +1782,7 @@ export class LettaBot implements AgentSession {
                   // Handle no response
                   if (!sentAnyMessage) {
                       if (!receivedAnyData) {
-                          console.error('[Bot] Stream received NO DATA - possible stuck state');
+                          log.error('[Bot] Stream received NO DATA - possible stuck state');
                           await adapter.sendMessage({
                               chatId: msg.chatId,
                               text: '(No response received -- the connection may have dropped or the server may be busy. Please try again. If this persists, /reset will start a fresh conversation.)',
@@ -1780,7 +1791,7 @@ export class LettaBot implements AgentSession {
                       } else {
                           const hadToolActivity = (msgTypeCounts['tool_call'] || 0) > 0 || (msgTypeCounts['tool_result'] || 0) > 0;
                           if (hadToolActivity) {
-                              console.log('[Bot] Agent had tool activity but no assistant message - likely sent via tool');
+                              log.info('[Bot] Agent had tool activity but no assistant message - likely sent via tool');
                           } else {
                               await adapter.sendMessage({
                                   chatId: msg.chatId,
@@ -1794,7 +1805,7 @@ export class LettaBot implements AgentSession {
                   hookDelivered = sentAnyMessage && !suppressDelivery;
 
               } catch (error) {
-                  console.error('[Bot] Error processing message:', error);
+                  log.error('[Bot] Error processing message:', error);
                   hookError = error instanceof Error ? error.message : 'Unknown error';
                   tracingSpan.recordError(error instanceof Error ? error : new Error(String(error)));
                   try {
@@ -1804,7 +1815,7 @@ export class LettaBot implements AgentSession {
                           threadId: msg.threadId,
                       });
                   } catch (sendError) {
-                      console.error('[Bot] Failed to send error message to channel:', sendError);
+                      log.error('[Bot] Failed to send error message to channel:', sendError);
                   }
               } finally {
                   // Session stays alive for reuse -- only invalidated on errors
@@ -1894,7 +1905,7 @@ export class LettaBot implements AgentSession {
       ...hookContextBase,
     });
     if (hookResult.skip) {
-      console.log('[Bot] preMessage hook requested skip — dropping message');
+      log.info('[Bot] preMessage hook requested skip — dropping message');
       return '';
     }
     if (hookResult.message) {
@@ -1979,7 +1990,7 @@ export class LettaBot implements AgentSession {
       ...hookContextBase,
     });
     if (hookResult.skip) {
-      console.log('[Bot] preMessage hook requested skip — dropping message');
+      log.info('[Bot] preMessage hook requested skip — dropping message');
       return;
     }
     if (hookResult.message) {
@@ -2064,12 +2075,12 @@ export class LettaBot implements AgentSession {
 
   setAgentId(agentId: string): void {
     this.store.agentId = agentId;
-    console.log(`[Bot] Agent ID set to: ${agentId}`);
+    log.info(`Agent ID set to: ${agentId}`);
   }
 
   reset(): void {
     this.store.reset();
-    console.log('Agent reset');
+    log.info('Agent reset');
   }
 
   getLastMessageTarget(): { channel: string; chatId: string } | null {
