@@ -486,11 +486,12 @@ export class LettaBot implements AgentSession {
         try {
           await access(resolvedPath, constants.R_OK);
         } catch {
-          console.warn(`[Bot] Directive send-file skipped: file not found or not readable at ${directive.path}`);
+          console.warn(`[Bot] Directive send-file skipped: file not readable at ${directive.path}`);
           continue;
         }
 
-        // File size guard (default: 50MB)
+        // File size guard: prevent sending huge files
+        // File size guard (default: 50MB, configurable via sendFileMaxSize)
         const maxSize = this.config.sendFileMaxSize ?? 50 * 1024 * 1024;
         try {
           const fileStat = await stat(resolvedPath);
