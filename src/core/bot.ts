@@ -7,7 +7,7 @@
 import { createAgent, createSession, resumeSession, imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
 import { mkdirSync } from 'node:fs';
 import { access, unlink, realpath, stat, constants } from 'node:fs/promises';
-import { extname, resolve } from 'node:path';
+import { extname, resolve, join } from 'node:path';
 import type { ChannelAdapter } from '../channels/types.js';
 import type { BotConfig, InboundMessage, MessageHookContext, MessageHooksConfig, TriggerContext } from './types.js';
 import type { AgentSession } from './interfaces.js';
@@ -538,6 +538,7 @@ export class LettaBot implements AgentSession {
     adapter: ChannelAdapter,
     chatId: string,
     fallbackMessageId?: string,
+    threadId?: string,
   ): Promise<boolean> {
     let acted = false;
     for (const directive of directives) {
@@ -565,19 +566,32 @@ export class LettaBot implements AgentSession {
           continue;
         }
 
-        // Path sandboxing: restrict to configured directory (default: workingDir)
-        const allowedDir = this.config.sendFileDir || this.config.workingDir;
+        // Path sandboxing: restrict to configured directory (default: data/outbound under workingDir)
+        const allowedDir = this.config.sendFileDir || join(this.config.workingDir, 'data', 'outbound');
         const resolvedPath = resolve(directive.path);
         if (!await isPathAllowed(resolvedPath, allowedDir)) {
           console.warn(`[Bot] Directive send-file blocked: ${directive.path} is outside allowed directory ${allowedDir}`);
           continue;
         }
 
-        // Async file existence check
+        // Async file existence + readability check
         try {
           await access(resolvedPath, constants.R_OK);
         } catch {
-          console.warn(`[Bot] Directive send-file skipped: file not found or not readable at ${directive.path}`);
+          console.warn(`[Bot] Directive send-file skipped: file not readable at ${directive.path}`);
+          continue;
+        }
+
+        // File size guard (default: 50MB, configurable via sendFileMaxSize)
+        const maxSize = this.config.sendFileMaxSize ?? 50 * 1024 * 1024;
+        try {
+          const fileStat = await stat(resolvedPath);
+          if (fileStat.size > maxSize) {
+            console.warn(`[Bot] Directive send-file blocked: ${directive.path} is ${fileStat.size} bytes (max: ${maxSize})`);
+            continue;
+          }
+        } catch {
+          console.warn(`[Bot] Directive send-file skipped: could not stat ${directive.path}`);
           continue;
         }
 
@@ -587,15 +601,17 @@ export class LettaBot implements AgentSession {
             filePath: resolvedPath,
             caption: directive.caption,
             kind: directive.kind ?? inferFileKind(resolvedPath),
+            threadId,
           });
           acted = true;
           console.log(`[Bot] Directive: sent file ${resolvedPath}`);
 
-          // Optional cleanup: delete file after successful send
-          if (directive.cleanup) {
+          // Optional cleanup: delete file after successful send.
+          // Only honored when sendFileCleanup is enabled in config (defense-in-depth).
+          if (directive.cleanup && this.config.sendFileCleanup) {
             try {
               await unlink(resolvedPath);
-              console.log(`[Bot] Directive: cleaned up ${resolvedPath}`);
+              console.warn(`[Bot] Directive: cleaned up ${resolvedPath}`);
             } catch (cleanupErr) {
               console.warn('[Bot] Directive send-file cleanup failed:', cleanupErr instanceof Error ? cleanupErr.message : cleanupErr);
             }
@@ -1369,7 +1385,7 @@ export class LettaBot implements AgentSession {
                       if (response.trim()) {
                           const {cleanText, directives} = parseDirectives(response);
                           response = cleanText;
-                          if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId)) {
+                          if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId, msg.threadId)) {
                               sentAnyMessage = true;
                           }
                       }
@@ -1677,7 +1693,7 @@ export class LettaBot implements AgentSession {
                   if (response.trim()) {
                       const {cleanText, directives} = parseDirectives(response);
                       response = cleanText;
-                      if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId)) {
+                      if (await this.executeDirectives(directives, adapter, msg.chatId, msg.messageId, msg.threadId)) {
                           sentAnyMessage = true;
                       }
                   }
