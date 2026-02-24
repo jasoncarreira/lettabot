@@ -749,7 +749,7 @@ export async function recoverOrphanedConversationApproval(
             const expectedMatch = errMsg.match(/Expected '\['([^']+)'\]/);
             if (expectedMatch) {
               const correctToolCallId = expectedMatch[1];
-              console.log(`[Letta API] Retrying denial for run ${runId} with corrected tool_call_id ${correctToolCallId}`);
+              log.info(`Retrying denial for run ${runId} with corrected tool_call_id ${correctToolCallId}`);
               try {
                 await client.conversations.messages.create(conversationId, {
                   messages: [{
@@ -766,12 +766,12 @@ export async function recoverOrphanedConversationApproval(
                 submitSucceeded = true;
               } catch (retryErr) {
                 const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-                console.warn(`[Letta API] Retry also failed for run ${runId}: ${retryMsg}`);
+                log.warn(`Retry also failed for run ${runId}: ${retryMsg}`);
                 details.push(`Failed to deny approval(s) for run ${runId}: ${retryMsg}`);
               }
             } else {
-              console.warn(`[Letta API] Could not submit ${approvalResponses.length} denial(s) for run ${runId}: ${errMsg}`);
-              details.push(`Failed to deny ${approvalResponses.length} approval(s) for run ${runId}: ${errMsg}`);
+              log.warn(`Could not submit ${approvalResponses.length} denial(s) for run ${runId}: ${errMsg}`);
+              details.push(`Failed to deny approval(s) for run ${runId}: ${errMsg}`);
             }
           }
           if (!submitSucceeded) continue;
