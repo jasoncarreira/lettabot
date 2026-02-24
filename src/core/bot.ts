@@ -618,13 +618,13 @@ export class LettaBot implements AgentSession {
           if (directive.cleanup && this.config.sendFileCleanup) {
             try {
               await unlink(resolvedPath);
-              log.warn(`Directive: cleaned up ${resolvedPath}`);
+              log.info(`Directive: cleaned up ${resolvedPath}`);
             } catch (cleanupErr) {
-              log.warn('[Bot] Directive send-file cleanup failed:', cleanupErr instanceof Error ? cleanupErr.message : cleanupErr);
+              log.warn('Directive send-file cleanup failed:', cleanupErr instanceof Error ? cleanupErr.message : cleanupErr);
             }
           }
         } catch (err) {
-          log.warn('[Bot] Directive send-file failed:', err instanceof Error ? err.message : err);
+          log.warn('Directive send-file failed:', err instanceof Error ? err.message : err);
         }
       }
     }

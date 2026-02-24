@@ -553,7 +553,7 @@ const globalConfig = {
   cronEnabled: process.env.CRON_ENABLED === 'true',  // Legacy env var fallback
   heartbeatSkipRecentUserMin: parseNonNegativeNumber(process.env.HEARTBEAT_SKIP_RECENT_USER_MIN),
 };
-const hooksDir = dirname(mainConfigPath);
+const hooksDir = dirname(resolveConfigPath());
 
 // Validate LETTA_API_KEY is set for API mode (docker mode doesn't require it)
 if (!isDockerServerMode(yamlConfig.server.mode) && !process.env.LETTA_API_KEY) {
