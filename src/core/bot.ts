@@ -6,7 +6,7 @@
 
 import { createAgent, createSession, resumeSession, imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
 import { mkdirSync } from 'node:fs';
-import { access, unlink, constants } from 'node:fs/promises';
+import { access, unlink, realpath, stat, constants } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import type { ChannelAdapter } from '../channels/types.js';
 import type { BotConfig, InboundMessage, MessageHookContext, MessageHooksConfig, TriggerContext } from './types.js';
@@ -112,13 +112,29 @@ export function inferFileKind(filePath: string): 'image' | 'file' {
 }
 
 /**
- * Check whether a resolved file path is inside the allowed directory.
- * Prevents path traversal attacks in the send-file directive.
+ * Check whether a file path is inside the allowed directory.
+ * Uses realpath() for both the file and directory to follow symlinks,
+ * preventing symlink-based escapes (e.g., data/evil -> /etc/passwd).
+ * Falls back to textual resolve() when paths don't exist on disk.
  */
-export function isPathAllowed(filePath: string, allowedDir: string): boolean {
-  const resolvedFile = resolve(filePath);
-  const resolvedDir = resolve(allowedDir);
-  return resolvedFile === resolvedDir || resolvedFile.startsWith(resolvedDir + '/');
+export async function isPathAllowed(filePath: string, allowedDir: string): Promise<boolean> {
+  // Resolve the allowed directory -- use realpath if it exists, resolve() otherwise
+  let canonicalDir: string;
+  try {
+    canonicalDir = await realpath(allowedDir);
+  } catch {
+    canonicalDir = resolve(allowedDir);
+  }
+
+  // Resolve the file -- use realpath if it exists, resolve() otherwise
+  let canonicalFile: string;
+  try {
+    canonicalFile = await realpath(filePath);
+  } catch {
+    canonicalFile = resolve(filePath);
+  }
+
+  return canonicalFile === canonicalDir || canonicalFile.startsWith(canonicalDir + '/');
 }
 
 async function buildMultimodalMessage(
@@ -552,7 +568,7 @@ export class LettaBot implements AgentSession {
         // Path sandboxing: restrict to configured directory (default: workingDir)
         const allowedDir = this.config.sendFileDir || this.config.workingDir;
         const resolvedPath = resolve(directive.path);
-        if (!isPathAllowed(resolvedPath, allowedDir)) {
+        if (!await isPathAllowed(resolvedPath, allowedDir)) {
           console.warn(`[Bot] Directive send-file blocked: ${directive.path} is outside allowed directory ${allowedDir}`);
           continue;
         }

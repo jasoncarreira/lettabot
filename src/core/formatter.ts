@@ -358,7 +358,8 @@ function buildResponseDirectives(msg: InboundMessage): string[] {
 
   // file sending (only if supported)
   if (supportsFiles) {
-    lines.push(`- To send a file: \`lettabot-message send --file /path/to/file.jpg\` (or \`--image\` for photos)`);
+    lines.push(`- \`<actions><send-file path="/path/to/file.png" kind="image" caption="..." /></actions>\` — send a file inline (path must be within the configured send-file directory)`);
+    lines.push(`- To send a file via CLI: \`lettabot-message send --file /path/to/file.jpg\` (or \`--image\` for photos)`);
   }
 
   return lines;
