@@ -63,6 +63,7 @@ export interface MessageHookContext {
   stage: 'pre' | 'postReasoning' | 'post';
   isHeartbeat: boolean;
   suppressDelivery: boolean;
+  isRetry?: boolean;
   trigger?: TriggerContext;
   inboundMessage?: InboundMessage;
   formattedText?: string;

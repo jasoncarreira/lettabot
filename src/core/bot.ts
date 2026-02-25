@@ -1291,6 +1291,7 @@ export class LettaBot implements AgentSession {
           ...this.buildHookContextBase(convKey, triggerContext, suppressDelivery),
           inboundMessage: msg,
           formattedText,
+          isRetry: retried,
       };
       hookContextBase = hookBase;
 
