@@ -7,6 +7,7 @@
 
 import { spawnSync } from 'node:child_process';
 import * as p from '@clack/prompts';
+import type { BlueskyConfig } from '../config/types.js';
 
 // ============================================================================
 // Channel Metadata
@@ -565,7 +566,7 @@ export async function setupSignal(existing?: any): Promise<any> {
   };
 }
 
-export async function setupBluesky(existing?: any): Promise<any> {
+export async function setupBluesky(existing?: BlueskyConfig): Promise<BlueskyConfig> {
   p.note(
     'Uses the Bluesky Jetstream WebSocket feed (read-only).\n' +
     'Provide one or more DID(s) to filter the stream.\n' +
@@ -671,7 +672,13 @@ export async function setupBluesky(existing?: any): Promise<any> {
     }
 
     const appPasswordInput = await p.password({
-      message: 'Bluesky app password',
+      message: 'Bluesky app password (format: xxxx-xxxx-xxxx-xxxx)',
+      validate: (v) => {
+        if (!v) return 'App password is required.';
+        if (!/^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/.test(v)) {
+          return 'Expected format: xxxx-xxxx-xxxx-xxxx (lowercase letters and digits).';
+        }
+      },
     });
 
     if (p.isCancel(appPasswordInput)) {
