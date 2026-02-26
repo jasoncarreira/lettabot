@@ -9,7 +9,7 @@ import { mkdirSync } from 'node:fs';
 import { access, unlink, realpath, stat, constants } from 'node:fs/promises';
 import { extname, resolve, join } from 'node:path';
 import type { ChannelAdapter } from '../channels/types.js';
-import type { BotConfig, InboundMessage, MessageHookContext, MessageHooksConfig, TriggerContext } from './types.js';
+import type { BotConfig, InboundMessage, MessageHookContext, MessageHooksConfig, ToolCallHookContext, ToolResultHookContext, TriggerContext } from './types.js';
 import type { AgentSession } from './interfaces.js';
 import { Store } from './store.js';
 import { updateAgentName, getPendingApprovals, rejectApproval, cancelRuns, recoverOrphanedConversationApproval } from '../tools/letta-api.js';
@@ -287,7 +287,8 @@ export class LettaBot implements AgentSession {
     mkdirSync(config.workingDir, { recursive: true });
     this.store = new Store('lettabot-agent.json', config.agentName);
     this.hooksConfig = config.hooks;
-    if (this.hooksConfig?.preMessage || this.hooksConfig?.postReasoning || this.hooksConfig?.postMessage) {
+    if (this.hooksConfig?.preMessage || this.hooksConfig?.postMessage ||
+        this.hooksConfig?.postReasoning || this.hooksConfig?.postToolCall || this.hooksConfig?.postToolResult) {
       const baseDir = config.hooksDir || process.cwd();
       this.hookRunner = new MessageHookRunner(baseDir);
       log.info(`Message hooks enabled (baseDir=${baseDir})`);
@@ -396,6 +397,16 @@ export class LettaBot implements AgentSession {
   private async runPostMessageHook(ctx: MessageHookContext): Promise<string | undefined> {
     if (!this.hookRunner || !this.hooksConfig?.postMessage) return undefined;
     return this.hookRunner.runPost(this.hooksConfig.postMessage, ctx);
+  }
+
+  private runToolCallHook(ctx: ToolCallHookContext): void {
+    if (!this.hookRunner || !this.hooksConfig?.postToolCall) return;
+    void this.hookRunner.runToolCall(this.hooksConfig.postToolCall, ctx);
+  }
+
+  private runToolResultHook(ctx: ToolResultHookContext): void {
+    if (!this.hookRunner || !this.hooksConfig?.postToolResult) return;
+    void this.hookRunner.runToolResult(this.hooksConfig.postToolResult, ctx);
   }
 
   // =========================================================================
@@ -861,23 +872,66 @@ export class LettaBot implements AgentSession {
     // Persist conversation ID immediately after successful send, before streaming.
     this.persistSessionState(session, convKey);
 
-    // Return session and a deduplicated stream generator
-    const seenToolCallIds = new Set<string>();
+    // Return session and a deduplicated stream generator that accumulates
+    // tool call argument chunks into a single complete event per call ID.
+    const pendingToolCalls = new Map<string, { msg: StreamMsg; accumulatedArgs: string }>();
     const self = this;
     const capturedConvKey = convKey; // Capture for closure
+
+    /** Merge tool argument strings, handling both delta and cumulative chunking. */
+    function mergeToolArgs(existing: string, incoming: string): string {
+      if (!incoming) return existing;
+      if (!existing) return incoming;
+      if (incoming === existing) return existing;
+      // Cumulative: latest chunk includes all prior text
+      if (incoming.startsWith(existing)) return incoming;
+      if (existing.endsWith(incoming)) return existing;
+      // Delta: each chunk is an append
+      return `${existing}${incoming}`;
+    }
+
+    function* flushPending(): Generator<StreamMsg> {
+      for (const [, pending] of pendingToolCalls) {
+        if (!pending.accumulatedArgs) {
+          // No rawArguments accumulated (old SDK or single complete chunk) --
+          // preserve the original toolInput from the first chunk as-is.
+          yield pending.msg;
+          continue;
+        }
+        let toolInput: Record<string, unknown> = {};
+        try { toolInput = JSON.parse(pending.accumulatedArgs); }
+        catch { toolInput = { raw: pending.accumulatedArgs }; }
+        yield { ...pending.msg, toolInput };
+      }
+      pendingToolCalls.clear();
+    }
 
     async function* dedupedStream(): AsyncGenerator<StreamMsg> {
       for await (const raw of session.stream()) {
         const msg = raw as StreamMsg;
 
-        // Deduplicate tool_call chunks (server streams token-by-token)
         if (msg.type === 'tool_call') {
           const id = msg.toolCallId;
-          if (id && seenToolCallIds.has(id)) continue;
-          if (id) seenToolCallIds.add(id);
+          if (!id) { yield msg; continue; }
+
+          const incoming = (msg as StreamMsg & { rawArguments?: string }).rawArguments || '';
+          const existing = pendingToolCalls.get(id);
+          if (existing) {
+            existing.accumulatedArgs = mergeToolArgs(existing.accumulatedArgs, incoming);
+          } else {
+            pendingToolCalls.set(id, { msg, accumulatedArgs: incoming });
+          }
+          continue; // buffer, don't yield yet
+        }
+
+        // Flush pending tool calls on semantic type boundary (not stream_event)
+        if (pendingToolCalls.size > 0 && msg.type !== 'stream_event') {
+          yield* flushPending();
         }
 
         if (msg.type === 'result') {
+          // Flush any remaining before result
+          yield* flushPending();
           self.persistSessionState(session, capturedConvKey);
         }
 
@@ -887,6 +941,9 @@ export class LettaBot implements AgentSession {
           break;
         }
       }
+
+      // Flush remaining at generator end (shouldn't normally happen)
+      yield* flushPending();
     }
 
     return { session, stream: dedupedStream };
@@ -1386,6 +1443,7 @@ export class LettaBot implements AgentSession {
                   } | null = null;
                   let retryInfo: { attempt: number; maxAttempts: number; reason: string } | null = null;
                   let reasoningBuffer = '';
+                  let reasoningStepIndex = 0;
                   const msgTypeCounts: Record<string, number> = {};
 
                   const finalizeMessage = async () => {
@@ -1450,20 +1508,25 @@ export class LettaBot implements AgentSession {
                           const preview = JSON.stringify(streamMsg).slice(0, 300);
                           log.info(`type=${streamMsg.type} ${preview}`);
 
+                          // stream_event is a non-semantic primitive that should not trigger
+                          // type-transition logic (reasoning flush, finalizeMessage, lastMsgType update).
+                          const isSemanticType = streamMsg.type !== 'stream_event';
+
                           // Finalize on type change (avoid double-handling when result provides full response)
-                          if (lastMsgType && lastMsgType !== streamMsg.type && response.trim() && streamMsg.type !== 'result') {
+                          if (isSemanticType && lastMsgType && lastMsgType !== streamMsg.type && response.trim() && streamMsg.type !== 'result') {
                               await finalizeMessage();
                           }
 
                           // Flush reasoning buffer when type changes away from reasoning.
                           // Tracing, postReasoning hook, and optional display all fire here together.
-                          if (lastMsgType === 'reasoning' && streamMsg.type !== 'reasoning' && reasoningBuffer.trim()) {
+                          if (isSemanticType && lastMsgType === 'reasoning' && streamMsg.type !== 'reasoning' && reasoningBuffer.trim()) {
                               tracingSpan.addReasoning(reasoningBuffer);
                               if (hookMessage && hookContextBase) {
                                   await this.runPostReasoningHook({
                                       stage: 'postReasoning',
                                       message: hookMessage,
                                       reasoning: reasoningBuffer,
+                                      stepIndex: reasoningStepIndex,
                                       ...hookContextBase,
                                   });
                               }
@@ -1477,6 +1540,7 @@ export class LettaBot implements AgentSession {
                                   }
                               }
                               reasoningBuffer = '';
+                              reasoningStepIndex++;
                           }
 
                           // Tool loop detection
@@ -1497,6 +1561,12 @@ export class LettaBot implements AgentSession {
                                   (streamMsg.toolInput || {}) as Record<string, unknown>,
                                   streamMsg.toolCallId
                               );
+                              this.runToolCallHook({
+                                  toolName: streamMsg.toolName || 'unknown',
+                                  toolInput: (streamMsg.toolInput || {}) as Record<string, unknown>,
+                                  toolCallId: streamMsg.toolCallId,
+                                  agent: hookContextBase?.agent,
+                              });
                               sawNonAssistantSinceLastUuid = true;
                               // Display tool call in channel if configured
                               if (this.config.display?.showToolCalls && !suppressDelivery) {
@@ -1515,6 +1585,13 @@ export class LettaBot implements AgentSession {
                                   streamMsg.content || '',
                                   streamMsg.isError
                               );
+                              this.runToolResultHook({
+                                  toolCallId: streamMsg.toolCallId || '',
+                                  toolName: (streamMsg as any).toolName,
+                                  content: streamMsg.content || '',
+                                  isError: streamMsg.isError ?? false,
+                                  agent: hookContextBase?.agent,
+                              });
                               sawNonAssistantSinceLastUuid = true;
                           } else if (streamMsg.type === 'assistant' && lastMsgType !== 'assistant') {
                               log.info(`Generating response...`);
@@ -1522,9 +1599,7 @@ export class LettaBot implements AgentSession {
                               if (lastMsgType !== 'reasoning') {
                                   log.info(`Reasoning...`);
                               }
-                              if (isPhoenixEnabled || this.config.display?.showReasoning) {
-                                  reasoningBuffer += streamMsg.content || '';
-                              }
+                              reasoningBuffer += streamMsg.content || '';
                               sawNonAssistantSinceLastUuid = true;
                           } else if (streamMsg.type === 'error') {
                               // SDK now surfaces error detail that was previously dropped.
@@ -1545,7 +1620,7 @@ export class LettaBot implements AgentSession {
                               sawNonAssistantSinceLastUuid = true;
                           }
 
-                          lastMsgType = streamMsg.type;
+                          if (isSemanticType) lastMsgType = streamMsg.type;
 
                           if (streamMsg.type === 'assistant') {
                               const msgUuid = streamMsg.uuid;
@@ -1695,6 +1770,22 @@ export class LettaBot implements AgentSession {
                       });
                   }
                   lap('stream complete');
+
+                  // Flush any trailing reasoning block that wasn't followed by another stream type
+                  if (reasoningBuffer.trim()) {
+                      tracingSpan.addReasoning(reasoningBuffer);
+                      if (hookMessage && hookContextBase) {
+                          await this.runPostReasoningHook({
+                              stage: 'postReasoning',
+                              message: hookMessage,
+                              reasoning: reasoningBuffer,
+                              stepIndex: reasoningStepIndex,
+                              ...hookContextBase,
+                          });
+                      }
+                      reasoningBuffer = '';
+                  }
+
                   if (!hookResponse && response.trim()) {
                       hookResponse = response;
                   }

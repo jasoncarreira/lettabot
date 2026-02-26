@@ -55,8 +55,10 @@ export interface HookHandlerConfig {
 
 export interface MessageHooksConfig {
   preMessage?: HookHandlerConfig;
-  postReasoning?: HookHandlerConfig;  // Called after reasoning accumulated, before response
+  postReasoning?: HookHandlerConfig;  // Called after each reasoning block is accumulated
   postMessage?: HookHandlerConfig;
+  postToolCall?: HookHandlerConfig;
+  postToolResult?: HookHandlerConfig;
 }
 
 export interface MessageHookContext {
@@ -70,8 +72,34 @@ export interface MessageHookContext {
   message: SendMessage;
   response?: string;
   reasoning?: string;       // Reasoning content (postReasoning stage only)
+  stepIndex?: number;       // Which reasoning block within the turn (0-based, postReasoning stage)
   delivered?: boolean;
   error?: string;
+  agent?: {
+    id?: string | null;
+    name?: string;
+    conversationId?: string | null;
+    conversationKey?: string;
+  };
+}
+
+export interface ToolCallHookContext {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolCallId?: string;
+  agent?: {
+    id?: string | null;
+    name?: string;
+    conversationId?: string | null;
+    conversationKey?: string;
+  };
+}
+
+export interface ToolResultHookContext {
+  toolCallId: string;
+  toolName?: string;
+  content: string;
+  isError: boolean;
   agent?: {
     id?: string | null;
     name?: string;

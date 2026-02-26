@@ -250,7 +250,7 @@ Each entry in `agents:` accepts:
 | `conversations` | object | No | Conversation routing (mode, heartbeat, perChannel overrides) |
 | `channels` | object | No | Channel configs (same schema as top-level `channels:`). At least one agent must have channels. |
 | `features` | object | No | Per-agent features (cron, heartbeat, memfs, maxToolCalls) |
-| `hooks` | object | No | Message hooks for this agent (preMessage/postReasoning/postMessage) |
+| `hooks` | object | No | Message hooks for this agent (preMessage/postReasoning/postToolCall/postToolResult/postMessage) |
 | `polling` | object | No | Per-agent polling config (Gmail, etc.) |
 | `integrations` | object | No | Per-agent integrations (Google, etc.) |
 
