@@ -36,6 +36,9 @@ lettabot-message send --file /path/to/image.jpg --text "Check this out!"
 # Send file without text (treated as image)
 lettabot-message send --file photo.png --image
 
+# Send voice note
+lettabot-message send --file voice.ogg --voice
+
 # Send to specific channel and chat
 lettabot-message send --text "Hello!" --channel telegram --chat 123456789
 lettabot-message send --text "Heartbeat update" --channel telegram --chat 123456789 --trigger heartbeat --output-mode silent
@@ -48,7 +51,7 @@ lettabot-react add --emoji :eyes: --channel telegram --chat 123456789 --message 
 
 # Note: File sending supported on telegram, slack, discord, whatsapp (via API)
 # For hooks, pass --trigger (or set LETTABOT_TRIGGER_TYPE) so ctx.trigger is populated.
-# Signal does not support files or reactions
+# Signal supports reactions (via directives) but not file sending
 
 # Discover channel IDs (Discord and Slack)
 lettabot-channels list
