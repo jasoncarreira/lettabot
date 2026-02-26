@@ -346,7 +346,6 @@ export interface BlueskyNotificationsConfig {
   limit?: number;           // Max notifications per request (default: 50)
   priority?: boolean;       // Priority only
   reasons?: string[];       // Filter reasons (e.g., ['mention','reply'])
-  backfill?: boolean;      // Process the initial backlog on startup
 }
 
 /**
@@ -637,7 +636,6 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
               : undefined,
             priority: process.env.BLUESKY_NOTIFICATIONS_PRIORITY === 'true',
             reasons: parseList(process.env.BLUESKY_NOTIFICATIONS_REASONS),
-            backfill: process.env.BLUESKY_NOTIFICATIONS_BACKFILL === 'true',
           }
         : undefined,
     };
