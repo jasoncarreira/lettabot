@@ -22,6 +22,8 @@ export interface ReasoningEvent {
   type: 'reasoning';
   /** Complete accumulated reasoning block. */
   content: string;
+  /** Unix timestamp (ms, performance.timeOrigin + performance.now()) when the first chunk of this reasoning block was received. */
+  startTimestamp: number;
 }
 
 export interface ToolCallEvent {
@@ -158,6 +160,7 @@ export async function* createDisplayPipeline(
 
   // ── Reasoning accumulation ──
   let reasoningBuffer = '';
+  let reasoningStartTimestamp = 0;
 
   // ── Assistant text accumulation ──
   let assistantText = '';
@@ -173,8 +176,9 @@ export async function* createDisplayPipeline(
   // ── Helpers ──
   function* flushReasoning(): Generator<DisplayEvent> {
     if (reasoningBuffer.trim()) {
-      yield { type: 'reasoning', content: reasoningBuffer };
+      yield { type: 'reasoning', content: reasoningBuffer, startTimestamp: reasoningStartTimestamp };
       reasoningBuffer = '';
+      reasoningStartTimestamp = 0;
     }
   }
 
@@ -238,6 +242,10 @@ export async function* createDisplayPipeline(
     switch (msg.type) {
       case 'reasoning': {
         const chunk = msg.content || '';
+        if (!reasoningBuffer) {
+          // Capture the start of this reasoning block for accurate hook timestamp
+          reasoningStartTimestamp = performance.timeOrigin + performance.now();
+        }
         // When a new chunk starts with a markdown block indicator (bold header,
         // heading, list item), insert a newline to prevent it running into the
         // previous text. This separates complete reasoning blocks (common with

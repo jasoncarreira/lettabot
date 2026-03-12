@@ -120,6 +120,8 @@ export interface AgentConfig {
   integrations?: {
     google?: GoogleConfig;
   };
+  /** Message hooks for this agent */
+  hooks?: import('../core/types.js').MessageHooksConfig;
 }
 
 export interface LettaBotConfig {
@@ -214,6 +216,9 @@ export interface LettaBotConfig {
   integrations?: {
     google?: GoogleConfig;
   };
+
+  // Message hooks (applies to all agents unless overridden per-agent)
+  hooks?: import('../core/types.js').MessageHooksConfig;
 
   // Transcription (inbound voice messages)
   transcription?: TranscriptionConfig;

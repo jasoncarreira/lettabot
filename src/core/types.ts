@@ -155,7 +155,91 @@ export interface SkillsConfig {
 }
 
 import type { SleeptimeTrigger, SleeptimeBehavior, SleeptimeConfig } from '../config/types.js';
+import type { SendMessage } from '@letta-ai/letta-code-sdk';
 export type { SleeptimeTrigger, SleeptimeBehavior, SleeptimeConfig };
+
+// =============================================================================
+// Message Hook Types
+// =============================================================================
+
+export type HookMode = 'await' | 'parallel';
+
+export interface HookHandlerConfig {
+  /** Path to ESM module exporting hook functions */
+  file: string;
+  /** 'await' (default, chained) or 'parallel' (fire-and-forget) */
+  mode?: HookMode;
+  /** Timeout in ms for await-mode hooks (default: 5000, 0 = no timeout) */
+  timeoutMs?: number;
+}
+
+export interface MessageHooksConfig {
+  preMessage?: HookHandlerConfig | HookHandlerConfig[];
+  postMessage?: HookHandlerConfig | HookHandlerConfig[];
+  postReasoning?: HookHandlerConfig | HookHandlerConfig[];
+  postToolCall?: HookHandlerConfig | HookHandlerConfig[];
+  postToolResult?: HookHandlerConfig | HookHandlerConfig[];
+}
+
+export interface MessageHookContext {
+  stage: 'pre' | 'postReasoning' | 'post';
+  /** Unique ID for this agent turn — same value across all hook stages for the same turn */
+  turnId: string;
+  timestamp: number;
+  isHeartbeat: boolean;
+  suppressDelivery: boolean;
+  isRetry?: boolean;
+  trigger?: TriggerContext;
+  inboundMessage?: InboundMessage;
+  formattedText?: string;
+  message: SendMessage;
+  response?: string;
+  delivered?: boolean;
+  error?: string;
+  reasoning?: string;
+  stepIndex?: number;
+  totalCostUsd?: number;
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+  agent?: {
+    id?: string | null;
+    name?: string;
+    conversationId?: string | null;
+    conversationKey?: string;
+  };
+}
+
+export interface ToolCallHookContext {
+  turnId: string;
+  timestamp: number;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolCallId?: string;
+  agent?: {
+    id?: string | null;
+    name?: string;
+    conversationId?: string | null;
+    conversationKey?: string;
+  };
+}
+
+export interface ToolResultHookContext {
+  turnId: string;
+  timestamp: number;
+  toolCallId: string;
+  toolName?: string;
+  content: string;
+  isError: boolean;
+  agent?: {
+    id?: string | null;
+    name?: string;
+    conversationId?: string | null;
+    conversationKey?: string;
+  };
+}
 
 /**
  * Bot configuration
@@ -207,6 +291,10 @@ export interface BotConfig {
   conversationOverrides?: string[]; // Channels that always use their own conversation (shared mode)
   maxSessions?: number; // Max concurrent sessions in per-chat mode (default: 10, LRU eviction)
   reuseSession?: boolean; // Reuse SDK subprocess across messages (default: true). Set false to eliminate stream state bleed at cost of ~5s latency per message.
+
+  // Message hooks
+  hooks?: MessageHooksConfig;
+  hooksDir?: string; // Base directory for resolving relative hook file paths (default: process.cwd())
 }
 
 /**

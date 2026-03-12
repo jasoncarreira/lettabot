@@ -5,12 +5,13 @@
  */
 
 import { imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, existsSync } from 'node:fs';
 import { access, unlink, realpath, stat, constants } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { extname, resolve, join } from 'node:path';
 import type { ChannelAdapter } from '../channels/types.js';
-import type { BotConfig, InboundMessage, TriggerContext, TriggerType, StreamMsg } from './types.js';
+import type { BotConfig, InboundMessage, TriggerContext, TriggerType, StreamMsg, MessageHookContext, ToolCallHookContext, ToolResultHookContext } from './types.js';
 import { formatApiErrorForUser } from './errors.js';
 import { formatToolCallDisplay, formatReasoningDisplay, formatQuestionsForChannel } from './display.js';
 import type { AgentSession } from './interfaces.js';
@@ -25,6 +26,7 @@ import { resolveEmoji } from './emoji.js';
 import { SessionManager } from './session-manager.js';
 import { createDisplayPipeline, type DisplayEvent, type CompleteEvent, type ErrorEvent } from './display-pipeline.js';
 import { TurnLogger, TurnAccumulator, generateTurnId, type TurnRecord } from './turn-logger.js';
+import { MessageHookRunner } from './hooks.js';
 
 
 import { createLogger } from '../logger.js';
@@ -41,6 +43,17 @@ const IMAGE_FILE_EXTENSIONS = new Set([
 const AUDIO_FILE_EXTENSIONS = new Set([
   '.ogg', '.opus', '.mp3', '.m4a', '.wav', '.aac', '.flac',
 ]);
+
+/** Extract token usage from a stream result message for hook context. */
+function extractUsage(msg: StreamMsg): MessageHookContext['usage'] | undefined {
+  const raw = msg.usage as Record<string, unknown> | undefined;
+  if (!raw || typeof raw !== 'object') return undefined;
+  return {
+    promptTokens: typeof raw.promptTokens === 'number' ? raw.promptTokens : undefined,
+    completionTokens: typeof raw.completionTokens === 'number' ? raw.completionTokens : undefined,
+    totalTokens: typeof raw.totalTokens === 'number' ? raw.totalTokens : undefined,
+  };
+}
 
 type StreamErrorDetail = {
   message: string;
@@ -235,6 +248,7 @@ export class LettaBot implements AgentSession {
   private conversationOverrides: Set<string> = new Set();
   private readonly sessionManager: SessionManager;
   private readonly turnLogger: TurnLogger | null;
+  private hookRunner?: MessageHookRunner;
 
   constructor(config: BotConfig) {
     this.config = config;
@@ -243,6 +257,11 @@ export class LettaBot implements AgentSession {
     this.turnLogger = config.logging?.turnLogFile
       ? new TurnLogger(config.logging.turnLogFile, config.logging.maxTurns)
       : null;
+    if (config.hooks && Object.values(config.hooks).some(Boolean)) {
+      const baseDir = config.hooksDir || process.cwd();
+      this.hookRunner = new MessageHookRunner(baseDir);
+      log.info(`Message hooks enabled (baseDir=${baseDir})`);
+    }
     if (config.reuseSession === false) {
       log.warn('Session reuse disabled (conversations.reuseSession=false): each foreground/background message uses a fresh SDK subprocess (~5s overhead per turn).');
     }
@@ -251,6 +270,50 @@ export class LettaBot implements AgentSession {
     }
     this.sessionManager = new SessionManager(this.store, config, this.processingKeys, this.lastResultRunFingerprints);
     log.info(`LettaBot initialized. Agent ID: ${this.store.agentId || '(new)'}`);
+  }
+
+  // =========================================================================
+  // Message hooks
+  // =========================================================================
+
+  private buildHookContextBase(conversationKey?: string): MessageHookContext['agent'] {
+    return {
+      id: this.store.agentId,
+      name: this.config.agentName,
+      conversationId: this.store.conversationId,
+      conversationKey,
+    };
+  }
+
+  private async runPreMessageHook(ctx: MessageHookContext): Promise<import('./hooks.js').PreHookResult> {
+    if (!this.hookRunner || !this.config.hooks?.preMessage) return {};
+    return this.hookRunner.runPre(this.config.hooks.preMessage, ctx);
+  }
+
+  private async runPostMessageHook(ctx: MessageHookContext): Promise<string | undefined> {
+    if (!this.hookRunner || !this.config.hooks?.postMessage) return undefined;
+    return this.hookRunner.runPost(this.config.hooks.postMessage, ctx);
+  }
+
+  private runReasoningHook(ctx: MessageHookContext): void {
+    if (!this.hookRunner || !this.config.hooks?.postReasoning) return;
+    this.hookRunner.runPostReasoning(this.config.hooks.postReasoning, ctx).catch(err => {
+      log.warn('Reasoning hook error:', err instanceof Error ? err.message : err);
+    });
+  }
+
+  private runToolCallHook(ctx: ToolCallHookContext): void {
+    if (!this.hookRunner || !this.config.hooks?.postToolCall) return;
+    this.hookRunner.runToolCall(this.config.hooks.postToolCall, ctx).catch(err => {
+      log.warn('Tool call hook error:', err instanceof Error ? err.message : err);
+    });
+  }
+
+  private runToolResultHook(ctx: ToolResultHookContext): void {
+    if (!this.hookRunner || !this.config.hooks?.postToolResult) return;
+    this.hookRunner.runToolResult(this.config.hooks.postToolResult, ctx).catch(err => {
+      log.warn('Tool result hook error:', err instanceof Error ? err.message : err);
+    });
   }
 
   // =========================================================================
@@ -1042,7 +1105,7 @@ export class LettaBot implements AgentSession {
     adapter: ChannelAdapter,
     suppressDelivery: boolean,
     lap: (label: string) => void,
-  ): Promise<{ messageToSend: SendMessage; canUseTool: CanUseToolCallback } | null> {
+  ): Promise<{ messageToSend: SendMessage; canUseTool: CanUseToolCallback; formattedText: string } | null> {
     this.lastUserMessageTime = new Date();
 
     // Skip heartbeat target update for listening mode (don't redirect heartbeats)
@@ -1094,7 +1157,7 @@ export class LettaBot implements AgentSession {
     lap('format message');
 
     const canUseTool = this.buildCanUseToolCallback(msg, adapter);
-    return { messageToSend, canUseTool };
+    return { messageToSend, canUseTool, formattedText };
   }
 
   private isNonRetryableError(lastErrorDetail: StreamErrorDetail | null, isTerminalError: boolean): boolean {
@@ -1186,19 +1249,60 @@ export class LettaBot implements AgentSession {
     if (!prepared) {
       return;
     }
-    const { messageToSend, canUseTool } = prepared;
+    const { messageToSend, canUseTool, formattedText } = prepared;
+
+    // Hook tracking state (populated after pre-hook, consumed in finally)
+    const convKey = this.resolveConversationKey(msg.channel, msg.chatId, msg.forcePerChat);
+    const triggerContext: TriggerContext = {
+      type: 'user_message',
+      outputMode: suppressDelivery ? 'silent' : 'responsive',
+      sourceChannel: msg.channel,
+      sourceChatId: msg.chatId,
+      sourceUserId: msg.userId,
+    };
+    const turnId = randomUUID();
+    let hookMessage: SendMessage | null = null;
+    let hookResponse = '';
+    let hookDelivered = false;
+    let hookError: string | undefined;
+    let postHookRan = false;
+    let turnCostUsd: number | undefined;
+    let turnUsage: MessageHookContext['usage'] | undefined;
+    let reasoningStepIndex = 0;
 
     // Run session
     let session: Session | null = null;
     try {
-      const convKey = this.resolveConversationKey(msg.channel, msg.chatId, msg.forcePerChat);
       const seq = ++this.sendSequence;
       const userText = msg.text || '';
       log.info(`processMessage seq=${seq} key=${convKey} retried=${retried} user=${msg.userId} textLen=${userText.length}`);
       if (userText.length > 0) {
         log.debug(`processMessage seq=${seq} textPreview=${userText.slice(0, 80)}`);
       }
-      const run = await this.sessionManager.runSession(messageToSend, { retried, canUseTool, convKey });
+
+      // Run pre-message hook
+      const preMessageContext: MessageHookContext = {
+        stage: 'pre',
+        turnId,
+        timestamp: performance.timeOrigin + performance.now(),
+        isHeartbeat: false,
+        isRetry: retried,
+        suppressDelivery,
+        trigger: triggerContext,
+        inboundMessage: msg,
+        formattedText,
+        message: messageToSend,
+        agent: this.buildHookContextBase(convKey),
+      };
+      const preHookResult = await this.runPreMessageHook(preMessageContext);
+      if (preHookResult.skip) {
+        log.info('preMessage hook returned skip — aborting agent call');
+        return;
+      }
+      const finalMessageToSend = preHookResult.message ?? messageToSend;
+      hookMessage = finalMessageToSend;
+
+      const run = await this.sessionManager.runSession(finalMessageToSend, { retried, canUseTool, convKey });
       lap('session send');
       session = run.session;
 
@@ -1284,7 +1388,7 @@ export class LettaBot implements AgentSession {
         adapter.sendTypingIndicator(msg.chatId).catch(() => {});
       }, 4000);
 
-      const turnId = this.turnLogger ? generateTurnId() : '';
+      const logTurnId = this.turnLogger ? generateTurnId() : '';
       const turnAcc = this.turnLogger ? new TurnAccumulator() : null;
       let turnWritten = false;
 
@@ -1328,6 +1432,20 @@ export class LettaBot implements AgentSession {
                   log.warn('Failed to send reasoning display:', err instanceof Error ? err.message : err);
                 }
               }
+              // Fire postReasoning hook (DisplayPipeline delivers complete reasoning blocks)
+              this.runReasoningHook({
+                stage: 'postReasoning',
+                turnId,
+                timestamp: event.startTimestamp,
+                isHeartbeat: false,
+                suppressDelivery,
+                trigger: triggerContext,
+                inboundMessage: msg,
+                message: hookMessage ?? messageToSend,
+                reasoning: event.content,
+                stepIndex: reasoningStepIndex++,
+                agent: this.buildHookContextBase(convKey),
+              });
               break;
             }
 
@@ -1360,6 +1478,16 @@ export class LettaBot implements AgentSession {
                   if (event.id) bashCommandByToolCallId.set(event.id, command);
                 }
               }
+
+              // Tool call hook
+              this.runToolCallHook({
+                turnId,
+                timestamp: performance.timeOrigin + performance.now(),
+                toolName: event.name,
+                toolInput: (event.args || {}) as Record<string, unknown>,
+                toolCallId: event.id,
+                agent: this.buildHookContextBase(convKey),
+              });
 
               // Display
               if (this.config.display?.showToolCalls && !suppressDelivery) {
@@ -1412,6 +1540,17 @@ export class LettaBot implements AgentSession {
                 repeatedBashFailureKey = null;
                 repeatedBashFailureCount = 0;
               }
+
+              // Tool result hook
+              this.runToolResultHook({
+                turnId,
+                timestamp: performance.timeOrigin + performance.now(),
+                toolCallId: event.toolCallId || '',
+                toolName: event.raw.toolName,
+                content: event.content,
+                isError: event.isError,
+                agent: this.buildHookContextBase(convKey),
+              });
               break;
             }
 
@@ -1504,6 +1643,10 @@ export class LettaBot implements AgentSession {
                 // allow result-text-based resend.
                 response = event.text;
               }
+
+              // Capture cost and usage for post-message hook
+              if (typeof event.raw.totalCostUsd === 'number') turnCostUsd = event.raw.totalCostUsd;
+              turnUsage = extractUsage(event.raw) ?? turnUsage;
 
               const hasResponse = response.trim().length > 0;
               const resultText = typeof event.raw.result === 'string' ? event.raw.result : '';
@@ -1646,7 +1789,7 @@ export class LettaBot implements AgentSession {
           const { events, output } = turnAcc.finalize();
           this.turnLogger.write({
             ts: new Date().toISOString(),
-            turnId,
+            turnId: logTurnId,
             trigger: 'user_message' as const,
             channel: msg.channel,
             chatId: msg.chatId,
@@ -1703,10 +1846,56 @@ export class LettaBot implements AgentSession {
       // Listening mode: agent processed for memory, suppress response delivery
       if (suppressDelivery) {
         log.info(`Listening mode: processed ${msg.channel}:${msg.chatId} for memory (response suppressed)`);
+        hookResponse = response;
+        if (hookMessage) {
+          void this.runPostMessageHook({
+            stage: 'post',
+            turnId,
+            timestamp: performance.timeOrigin + performance.now(),
+            isHeartbeat: false,
+            suppressDelivery,
+            trigger: triggerContext,
+            inboundMessage: msg,
+            formattedText,
+            message: hookMessage,
+            response: hookResponse,
+            delivered: false,
+            totalCostUsd: turnCostUsd,
+            usage: turnUsage,
+            agent: this.buildHookContextBase(convKey),
+          });
+          postHookRan = true;
+        }
         return;
       }
 
       lap('directives done');
+
+      // Run post-message hook (before delivery so it can modify the response)
+      if (hookMessage) {
+        hookResponse = response;
+        const hookResult = await this.runPostMessageHook({
+          stage: 'post',
+          turnId,
+          timestamp: performance.timeOrigin + performance.now(),
+          isHeartbeat: false,
+          suppressDelivery,
+          trigger: triggerContext,
+          inboundMessage: msg,
+          formattedText,
+          message: hookMessage,
+          response: hookResponse,
+          totalCostUsd: turnCostUsd,
+          usage: turnUsage,
+          agent: this.buildHookContextBase(convKey),
+        });
+        postHookRan = true;
+        if (hookResult !== undefined) {
+          response = hookResult;
+          hookResponse = hookResult;
+        }
+      }
+
       // Send final response
       if (response.trim()) {
         const rateLimitRemaining = rateLimitedUntil - Date.now();
@@ -1741,6 +1930,7 @@ export class LettaBot implements AgentSession {
       
     } catch (error) {
       log.error('Error processing message:', error);
+      hookError = error instanceof Error ? error.message : 'Unknown error';
       try {
         await adapter.sendMessage({
           chatId: msg.chatId,
@@ -1751,6 +1941,26 @@ export class LettaBot implements AgentSession {
         log.error('Failed to send error message to channel:', sendError);
       }
     } finally {
+      // Fire post-hook on error paths that didn't reach it above
+      if (!postHookRan && hookMessage) {
+        void this.runPostMessageHook({
+          stage: 'post',
+          turnId,
+          timestamp: performance.timeOrigin + performance.now(),
+          isHeartbeat: false,
+          suppressDelivery,
+          trigger: triggerContext,
+          inboundMessage: msg,
+          formattedText,
+          message: hookMessage,
+          response: hookResponse,
+          delivered: hookDelivered,
+          error: hookError,
+          totalCostUsd: turnCostUsd,
+          usage: turnUsage,
+          agent: this.buildHookContextBase(convKey),
+        }).catch(() => {});
+      }
       const finalConvKey = this.resolveConversationKey(msg.channel, msg.chatId, msg.forcePerChat);
       // When session reuse is disabled, invalidate after every message to
       // eliminate any possibility of stream state bleed between sequential
@@ -1812,9 +2022,53 @@ export class LettaBot implements AgentSession {
     context?: TriggerContext
   ): Promise<string> {
     const isSilent = context?.outputMode === 'silent';
+    const suppressDelivery = isSilent;
     const convKey = this.resolveHeartbeatConversationKey();
     const acquired = await this.acquireLock(convKey);
-    
+
+    const turnId = randomUUID();
+    let hookMessage: SendMessage = text;
+    const hookContextBase: Omit<MessageHookContext, 'stage' | 'message'> = {
+      turnId,
+      timestamp: performance.timeOrigin + performance.now(),
+      isHeartbeat: context?.type === 'heartbeat',
+      suppressDelivery,
+      trigger: context,
+      agent: this.buildHookContextBase(convKey),
+    };
+    let hookResponse = '';
+    let hookError: string | undefined;
+    let postHookRan = false;
+    let turnCostUsd: number | undefined;
+    let turnUsage: MessageHookContext['usage'] | undefined;
+    const runPostHookOnce = async (currentResponse: string, error?: string): Promise<string> => {
+      if (postHookRan) return currentResponse;
+      postHookRan = true;
+      const override = await this.runPostMessageHook({
+        ...hookContextBase,
+        stage: 'post',
+        message: hookMessage,
+        response: currentResponse,
+        delivered: false,
+        error,
+        totalCostUsd: turnCostUsd,
+        usage: turnUsage,
+      });
+      return override ?? currentResponse;
+    };
+
+    const preResult = await this.runPreMessageHook({
+      ...hookContextBase,
+      stage: 'pre',
+      message: hookMessage,
+    });
+    if (preResult.skip) {
+      log.info('preMessage hook returned skip — aborting sendToAgent call');
+      this.releaseLock(convKey, acquired);
+      return '';
+    }
+    if (preResult.message) hookMessage = preResult.message;
+
     const sendT0 = performance.now();
     const sendTurnId = this.turnLogger ? generateTurnId() : '';
     const sendTurnAcc = this.turnLogger ? new TurnAccumulator() : null;
@@ -1824,10 +2078,12 @@ export class LettaBot implements AgentSession {
       let retried = false;
 
       while (true) {
-        const { stream } = await this.sessionManager.runSession(text, { convKey, retried });
+        const { stream } = await this.sessionManager.runSession(hookMessage, { convKey, retried });
 
         try {
           let response = '';
+          let reasoningBuffer = '';
+          let reasoningStepIndex = 0;
           let sawStaleDuplicateResult = false;
           let approvalRetryPending = false;
           let usedMessageCli = false;
@@ -1840,6 +2096,28 @@ export class LettaBot implements AgentSession {
                 const cmd = String((msg as any).toolInput?.command ?? msg.rawArguments ?? '');
                 if (cmd.includes('lettabot-message send')) usedMessageCli = true;
               }
+              const tcName = msg.toolName || 'unknown';
+              const tcId = (msg.toolCallId as string | undefined)?.slice(0, 12) || '?';
+              log.info(`>>> TOOL CALL: ${tcName} (id: ${tcId})`);
+              this.runToolCallHook({
+                turnId,
+                timestamp: performance.timeOrigin + performance.now(),
+                toolName: tcName,
+                toolInput: (msg.toolInput || {}) as Record<string, unknown>,
+                toolCallId: (msg.toolCallId as string | undefined) || '',
+                agent: this.buildHookContextBase(convKey),
+              });
+            } else if (msg.type === 'tool_result') {
+              log.info(`<<< TOOL RESULT: error=${msg.isError}, len=${(msg as any).content?.length || 0}`);
+              this.runToolResultHook({
+                turnId,
+                timestamp: performance.timeOrigin + performance.now(),
+                toolCallId: (msg.toolCallId as string | undefined) || '',
+                toolName: msg.toolName,
+                content: (msg as any).content || '',
+                isError: !!msg.isError,
+                agent: this.buildHookContextBase(convKey),
+              });
             }
             if (msg.type === 'error') {
               lastErrorDetail = {
@@ -1849,16 +2127,40 @@ export class LettaBot implements AgentSession {
               };
             }
             if (msg.type === 'reasoning') {
-              // Skip reasoning -- internal thinking should not leak into delivery
+              reasoningBuffer += msg.content || '';
             } else if (msg.type === 'assistant') {
+              if (reasoningBuffer) {
+                this.runReasoningHook({
+                  ...hookContextBase,
+                  stage: 'postReasoning',
+                  message: hookMessage,
+                  reasoning: reasoningBuffer,
+                  stepIndex: reasoningStepIndex++,
+                });
+                reasoningBuffer = '';
+              }
               response += msg.content || '';
             }
             if (msg.type === 'result') {
+              // Fire any remaining reasoning hook before processing result
+              if (reasoningBuffer) {
+                this.runReasoningHook({
+                  ...hookContextBase,
+                  stage: 'postReasoning',
+                  message: hookMessage,
+                  reasoning: reasoningBuffer,
+                  stepIndex: reasoningStepIndex++,
+                });
+                reasoningBuffer = '';
+              }
               const resultRunState = this.classifyResultRun(convKey, msg);
               if (resultRunState === 'stale') {
                 sawStaleDuplicateResult = true;
                 break;
               }
+              // Capture cost and usage for post-message hook
+              if (typeof msg.totalCostUsd === 'number') turnCostUsd = msg.totalCostUsd;
+              turnUsage = extractUsage(msg) ?? turnUsage;
 
               // TODO(letta-code-sdk#31): Remove once SDK handles HITL approvals in bypassPermissions mode.
               if (msg.success === false || msg.error) {
@@ -1956,10 +2258,13 @@ export class LettaBot implements AgentSession {
               log.warn(`Silent mode: agent produced ${response.length} chars but did NOT use lettabot-message CLI or directives — response discarded. If this keeps happening, the agent's model may not be following silent mode instructions.`);
             }
           }
+          response = await runPostHookOnce(response);
           return response;
         } catch (error) {
           // Invalidate on stream errors so next call gets a fresh subprocess
           this.sessionManager.invalidateSession(convKey);
+          hookError = error instanceof Error ? error.message : 'Unknown error';
+          await runPostHookOnce('', hookError).catch(() => {});
           throw error;
         }
 

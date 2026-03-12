@@ -6,7 +6,7 @@
  */
 
 import { existsSync, mkdirSync, promises as fs } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 // API server imports
 import { createApiServer } from './api/server.js';
@@ -371,6 +371,8 @@ async function main() {
       reuseSession: agentConfig.conversations?.reuseSession,
       redaction: agentConfig.security?.redaction,
       logging: agentConfig.features?.logging ?? yamlConfig.features?.logging,
+      hooks: agentConfig.hooks ?? yamlConfig.hooks,
+      hooksDir: dirname(configPath),
       cronStorePath,
       skills: {
         cronEnabled: agentConfig.features?.cron ?? globalConfig.cronEnabled,
