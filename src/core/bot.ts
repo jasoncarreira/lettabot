@@ -1794,7 +1794,7 @@ export class LettaBot implements AgentSession {
             channel: msg.channel,
             chatId: msg.chatId,
             userId: msg.userId,
-            input: typeof messageToSend === 'string' ? messageToSend : '[multimodal]',
+            input: typeof hookMessage === 'string' ? hookMessage : (hookMessage ? '[multimodal]' : (typeof messageToSend === 'string' ? messageToSend : '[multimodal]')),
             events,
             output: output || response,
             durationMs: Math.round(performance.now() - t0),
