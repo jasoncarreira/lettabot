@@ -4,7 +4,7 @@
  * Single agent, single conversation - chat continues across all channels.
  */
 
-import { imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
+import { imageFromBase64, type ImageContent, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, existsSync } from 'node:fs';
 import { readFile, access, unlink, realpath, stat, constants } from 'node:fs/promises';
@@ -51,6 +51,68 @@ const IMAGE_FILE_EXTENSIONS = new Set([
 const AUDIO_FILE_EXTENSIONS = new Set([
   '.ogg', '.opus', '.mp3', '.m4a', '.wav', '.aac', '.flac',
 ]);
+
+/** Anthropic recommends max 1568px on longest side; larger images waste bandwidth for no benefit. */
+const MAX_IMAGE_DIMENSION = 1568;
+
+const MIME_FROM_EXT: Record<string, ImageContent['source']['media_type']> = {
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+};
+
+/**
+ * Read, resize (if needed), and base64-encode an image for the LLM.
+ * Returns null on any failure so the caller can skip gracefully.
+ */
+async function prepareImage(
+  source: { localPath?: string; url?: string; mimeType?: string; name?: string },
+): Promise<ImageContent | null> {
+  let buffer: Buffer;
+  let mediaType: ImageContent['source']['media_type'];
+
+  // Resolve media type from attachment metadata or file extension
+  const resolveMime = (hint?: string, path?: string): ImageContent['source']['media_type'] => {
+    if (hint && SUPPORTED_IMAGE_MIMES.has(hint)) return hint as ImageContent['source']['media_type'];
+    if (path) {
+      const ext = extname(path).toLowerCase();
+      if (MIME_FROM_EXT[ext]) return MIME_FROM_EXT[ext];
+    }
+    return 'image/jpeg'; // safe default
+  };
+
+  if (source.localPath) {
+    buffer = await readFile(source.localPath);
+    mediaType = resolveMime(source.mimeType, source.localPath);
+  } else if (source.url) {
+    const response = await fetch(source.url);
+    if (!response.ok) {
+      log.warn(`Failed to fetch image from ${source.url}: HTTP ${response.status}`);
+      return null;
+    }
+    buffer = Buffer.from(await response.arrayBuffer());
+    const ct = response.headers.get('content-type') ?? undefined;
+    mediaType = resolveMime(ct ?? source.mimeType, source.url);
+  } else {
+    return null;
+  }
+
+  // Resize if the longest side exceeds the threshold
+  const metadata = await sharp(buffer).metadata();
+  const longest = Math.max(metadata.width ?? 0, metadata.height ?? 0);
+
+  if (longest > MAX_IMAGE_DIMENSION) {
+    log.info(`Resizing image ${source.name || 'unknown'} from ${metadata.width}x${metadata.height} (max side → ${MAX_IMAGE_DIMENSION}px)`);
+    buffer = await sharp(buffer)
+      .resize({ width: MAX_IMAGE_DIMENSION, height: MAX_IMAGE_DIMENSION, fit: 'inside', withoutEnlargement: true })
+      .toBuffer();
+  }
+
+  const data = buffer.toString('base64');
+  return imageFromBase64(data, mediaType);
+}
 
 /** Extract token usage from a stream result message for hook context. */
 function extractUsage(msg: StreamMsg): MessageHookContext['usage'] | undefined {
@@ -2106,7 +2168,7 @@ export class LettaBot implements AgentSession {
       let retried = false;
 
       while (true) {
-        const { stream } = await this.sessionManager.runSession(hookMessage, { convKey, retried });
+        const { session, stream } = await this.sessionManager.runSession(hookMessage, { convKey, retried });
 
         try {
           if (this.backgroundCancelledKeys.has(convKey)) {
