@@ -2115,6 +2115,7 @@ export class LettaBot implements AgentSession {
     const convKey = this.resolveHeartbeatConversationKey();
     const triggerType = context?.type ?? 'heartbeat';
     const acquired = await this.acquireLock(convKey);
+    this.activeBackgroundTriggerByKey.set(convKey, triggerType);
 
     const turnId = randomUUID();
     let hookMessage: SendMessage = text;
@@ -2378,6 +2379,12 @@ export class LettaBot implements AgentSession {
           response = await runPostHookOnce(response);
           return response;
         } catch (error) {
+          // If this was a background run that got cancelled, return empty string
+          if (this.backgroundCancelledKeys.has(convKey)) {
+            log.info(`sendToAgent: cancelled background stream threw error, returning empty (key=${convKey})`);
+            await runPostHookOnce('', '').catch(() => {});
+            return '';
+          }
           // Invalidate on stream errors so next call gets a fresh subprocess
           this.sessionManager.invalidateSession(convKey);
           hookError = error instanceof Error ? error.message : 'Unknown error';
