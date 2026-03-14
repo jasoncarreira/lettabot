@@ -7,7 +7,8 @@
 import { imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, existsSync } from 'node:fs';
-import { access, unlink, realpath, stat, constants } from 'node:fs/promises';
+import { readFile, access, unlink, realpath, stat, constants } from 'node:fs/promises';
+import sharp from 'sharp';
 import { execFile } from 'node:child_process';
 import { extname, resolve, join } from 'node:path';
 import type { ChannelAdapter } from '../channels/types.js';
@@ -20,8 +21,15 @@ import { getPendingApprovals, rejectApproval, cancelRuns, cancelConversation, re
 import { getAgentSkillExecutableDirs, isVoiceMemoConfigured } from '../skills/loader.js';
 import { formatMessageEnvelope, formatGroupBatchEnvelope, type SessionContextOptions } from './formatter.js';
 import type { GroupBatcher } from './group-batcher.js';
+import { recoverPendingApprovalsWithSdk } from './session-sdk-compat.js';
 import { redactOutbound } from './redact.js';
-import { parseDirectives, stripActionsBlock, type Directive } from './directives.js';
+import {
+  hasIncompleteActionsTag,
+  hasUnclosedActionsBlock,
+  parseDirectives,
+  stripActionsBlock,
+  type Directive,
+} from './directives.js';
 import { resolveEmoji } from './emoji.js';
 import { SessionManager } from './session-manager.js';
 import { createDisplayPipeline, type DisplayEvent, type CompleteEvent, type ErrorEvent } from './display-pipeline.js';
@@ -131,11 +139,8 @@ async function buildMultimodalMessage(
 
   for (const attachment of imageAttachments) {
     try {
-      if (attachment.localPath) {
-        content.push(imageFromFile(attachment.localPath));
-      } else if (attachment.url) {
-        content.push(await imageFromURL(attachment.url));
-      }
+      const item = await prepareImage(attachment);
+      if (item) content.push(item);
     } catch (err) {
       log.warn(`Failed to load image ${attachment.name || 'unknown'}: ${err instanceof Error ? err.message : err}`);
     }
@@ -234,6 +239,8 @@ export class LettaBot implements AgentSession {
   private processing = false; // Global lock for shared mode
   private processingKeys: Set<string> = new Set(); // Per-key locks for per-channel mode
   private cancelledKeys: Set<string> = new Set(); // Tracks keys where /cancel was issued
+  private backgroundCancelledKeys: Set<string> = new Set(); // Tracks background runs cancelled by live user activity
+  private activeBackgroundTriggerByKey: Map<string, string> = new Map();
   private sendSequence = 0; // Monotonic counter for desync diagnostics
   // Forward-looking: stale-result detection via runIds becomes active once the
   // SDK surfaces non-empty result run_ids. Until then, this map mostly stays
@@ -967,6 +974,23 @@ export class LettaBot implements AgentSession {
   // =========================================================================
   // Message queue
   // =========================================================================
+
+  private maybePreemptHeartbeatForUserMessage(convKey: string): void {
+    if (this.config.interruptHeartbeatOnUserMessage === false) {
+      return;
+    }
+
+    if (this.activeBackgroundTriggerByKey.get(convKey) !== 'heartbeat') {
+      return;
+    }
+
+    this.backgroundCancelledKeys.add(convKey);
+    const session = this.sessionManager.getSession(convKey);
+    if (session) {
+      session.abort().catch(() => {});
+    }
+    log.info(`Preempted in-flight heartbeat due to user message (key=${convKey})`);
+  }
   
   private async handleMessage(msg: InboundMessage, adapter: ChannelAdapter): Promise<void> {
     // AskUserQuestion support: if the agent is waiting for a user answer,
@@ -982,6 +1006,8 @@ export class LettaBot implements AgentSession {
       this.pendingQuestionResolvers.delete(incomingConvKey);
       return;
     }
+
+    this.maybePreemptHeartbeatForUserMessage(incomingConvKey);
 
     log.info(`Message from ${msg.userId} on ${msg.channel}: ${msg.text}`);
 
@@ -1576,8 +1602,8 @@ export class LettaBot implements AgentSession {
               const canEdit = adapter.supportsEditing?.() ?? false;
               const trimmed = response.trim();
               const mayBeHidden = '<no-reply/>'.startsWith(trimmed)
-                || '<actions>'.startsWith(trimmed)
-                || (trimmed.startsWith('<actions') && !trimmed.includes('</actions>'));
+                || hasIncompleteActionsTag(response)
+                || hasUnclosedActionsBlock(response);
               const streamText = stripActionsBlock(response).trim();
               if (canEdit && !mayBeHidden && !suppressDelivery && !this.cancelledKeys.has(convKey)
                 && streamText.length > 0 && Date.now() - lastUpdate > 1500 && Date.now() > rateLimitedUntil) {
@@ -1680,6 +1706,7 @@ export class LettaBot implements AgentSession {
                   (!lastErrorDetail || lastErrorDetail.message === 'Agent stopped: error')) {
                 const enriched = await getLatestRunError(this.store.agentId, retryConvId);
                 if (enriched) {
+                  log.info(`Enriched error detail: ${enriched.message} [${enriched.stopReason}]`);
                   lastErrorDetail = {
                     message: enriched.message,
                     stopReason: enriched.stopReason,
@@ -1694,33 +1721,33 @@ export class LettaBot implements AgentSession {
 
               // Approval conflict recovery
               if (retryDecision.isApprovalConflict && !retried && this.store.agentId) {
-                if (retryConvId) {
-                  log.info('Approval conflict detected -- attempting targeted recovery...');
-                  this.sessionManager.invalidateSession(retryConvKey);
-                  session = null;
-                  clearInterval(typingInterval);
-                  const convResult = await recoverOrphanedConversationApproval(
-                    this.store.agentId, retryConvId, true,
-                  );
-                  if (convResult.recovered) {
-                    log.info(`Approval recovery succeeded (${convResult.details}), retrying message...`);
+                log.info('Approval conflict detected -- attempting SDK recovery...');
+                clearInterval(typingInterval);
+
+                // Try SDK-level recovery first (through CLI control protocol)
+                if (session) {
+                  const sdkResult = await recoverPendingApprovalsWithSdk(session, 10_000);
+                  if (sdkResult.recovered) {
+                    log.info('SDK approval recovery succeeded, retrying message...');
+                    this.sessionManager.invalidateSession(retryConvKey);
+                    session = null;
                     return this.processMessage(msg, adapter, true);
                   }
-                  log.warn(`Approval recovery failed: ${convResult.details}`);
-                  return this.processMessage(msg, adapter, true);
-                } else {
-                  log.info('Approval conflict in default conversation -- attempting agent-level recovery...');
-                  this.sessionManager.invalidateSession(retryConvKey);
-                  session = null;
-                  clearInterval(typingInterval);
-                  const agentResult = await recoverPendingApprovalsForAgent(this.store.agentId);
-                  if (agentResult.recovered) {
-                    log.info(`Agent-level recovery succeeded (${agentResult.details}), retrying message...`);
-                    return this.processMessage(msg, adapter, true);
-                  }
-                  log.warn(`Agent-level recovery failed: ${agentResult.details}`);
-                  return this.processMessage(msg, adapter, true);
+                  log.warn(`SDK recovery did not resolve (${sdkResult.detail ?? 'unknown'}), trying API-level recovery...`);
                 }
+
+                // Fall back to API-level recovery
+                this.sessionManager.invalidateSession(retryConvKey);
+                session = null;
+                const result = (retryConvId && isRecoverableConversationId(retryConvId))
+                  ? await recoverOrphanedConversationApproval(this.store.agentId, retryConvId, true)
+                  : await recoverPendingApprovalsForAgent(this.store.agentId);
+                if (result.recovered) {
+                  log.info(`API-level recovery succeeded (${result.details}), retrying message...`);
+                } else {
+                  log.warn(`API-level recovery failed: ${result.details}`);
+                }
+                return this.processMessage(msg, adapter, true);
               }
 
               // Empty/error result retry
@@ -2024,6 +2051,7 @@ export class LettaBot implements AgentSession {
     const isSilent = context?.outputMode === 'silent';
     const suppressDelivery = isSilent;
     const convKey = this.resolveHeartbeatConversationKey();
+    const triggerType = context?.type ?? 'heartbeat';
     const acquired = await this.acquireLock(convKey);
 
     const turnId = randomUUID();
@@ -2081,6 +2109,11 @@ export class LettaBot implements AgentSession {
         const { stream } = await this.sessionManager.runSession(hookMessage, { convKey, retried });
 
         try {
+          if (this.backgroundCancelledKeys.has(convKey)) {
+            session.abort().catch(() => {});
+            log.info(`sendToAgent: background run cancelled before stream start (key=${convKey})`);
+            return '';
+          }
           let response = '';
           let reasoningBuffer = '';
           let reasoningStepIndex = 0;
@@ -2089,6 +2122,11 @@ export class LettaBot implements AgentSession {
           let usedMessageCli = false;
           let lastErrorDetail: StreamErrorDetail | undefined;
           for await (const msg of stream()) {
+            if (this.backgroundCancelledKeys.has(convKey)) {
+              session.abort().catch(() => {});
+              log.info(`sendToAgent: cancelled in-flight background stream (key=${convKey})`);
+              return '';
+            }
             sendTurnAcc?.feedRaw(msg);
             if (msg.type === 'tool_call') {
               this.sessionManager.syncTodoToolCall(msg);
@@ -2164,12 +2202,17 @@ export class LettaBot implements AgentSession {
 
               // TODO(letta-code-sdk#31): Remove once SDK handles HITL approvals in bypassPermissions mode.
               if (msg.success === false || msg.error) {
+                if (this.backgroundCancelledKeys.has(convKey)) {
+                  log.info(`sendToAgent: cancelled heartbeat produced terminal error result; suppressing (key=${convKey})`);
+                  return '';
+                }
                 // Enrich opaque errors from run metadata (mirrors processMessage logic).
                 const convId = typeof msg.conversationId === 'string' ? msg.conversationId : undefined;
                 if (this.store.agentId &&
                     (!lastErrorDetail || lastErrorDetail.message === 'Agent stopped: error')) {
                   const enriched = await getLatestRunError(this.store.agentId, convId);
                   if (enriched) {
+                    log.info(`Enriched error detail: ${enriched.message} [${enriched.stopReason}]`);
                     lastErrorDetail = {
                       message: enriched.message,
                       stopReason: enriched.stopReason,
@@ -2181,15 +2224,21 @@ export class LettaBot implements AgentSession {
                   || ((lastErrorDetail?.message?.toLowerCase().includes('conflict') || false)
                   && (lastErrorDetail?.message?.toLowerCase().includes('waiting for approval') || false));
                 if (isApprovalIssue && !retried) {
-                  if (this.store.agentId) {
-                    const recovery = await recoverPendingApprovalsForAgent(this.store.agentId);
-                    if (recovery.recovered) {
-                      log.info(`sendToAgent: agent-level approval recovery succeeded (${recovery.details})`);
-                    } else {
-                      log.warn(`sendToAgent: agent-level approval recovery did not resolve approvals (${recovery.details})`);
+                  log.info('sendToAgent: approval conflict detected -- attempting SDK recovery...');
+                  const sdkResult = await recoverPendingApprovalsWithSdk(session, 10_000);
+                  if (sdkResult.recovered) {
+                    log.info('sendToAgent: SDK approval recovery succeeded');
+                  } else {
+                    log.warn(`sendToAgent: SDK recovery did not resolve (${sdkResult.detail ?? 'unknown'}), trying API-level recovery...`);
+                    if (this.store.agentId) {
+                      const recovery = await recoverPendingApprovalsForAgent(this.store.agentId);
+                      if (recovery.recovered) {
+                        log.info(`sendToAgent: API-level recovery succeeded (${recovery.details})`);
+                      } else {
+                        log.warn(`sendToAgent: API-level recovery failed (${recovery.details})`);
+                      }
                     }
                   }
-                  log.info('sendToAgent: approval issue detected -- retrying once with fresh session...');
                   this.sessionManager.invalidateSession(convKey);
                   retried = true;
                   approvalRetryPending = true;
@@ -2251,6 +2300,12 @@ export class LettaBot implements AgentSession {
             }
           }
 
+          // Strip <no-reply/> marker so callers (cron, webhooks) see empty string
+          if (response.trim() === '<no-reply/>') {
+            log.info('sendToAgent: agent responded with <no-reply/> marker, suppressing');
+            response = '';
+          }
+
           if (isSilent && response.trim()) {
             if (usedMessageCli || executedDirectives) {
               log.info(`Silent mode: agent delivered via ${[usedMessageCli && 'CLI', executedDirectives && 'directives'].filter(Boolean).join(' + ')}, remaining text (${response.length} chars) not delivered`);
@@ -2270,6 +2325,8 @@ export class LettaBot implements AgentSession {
 
       }
     } finally {
+      this.activeBackgroundTriggerByKey.delete(convKey);
+      this.backgroundCancelledKeys.delete(convKey);
       if (this.config.reuseSession === false) {
         this.sessionManager.invalidateSession(convKey);
       }
