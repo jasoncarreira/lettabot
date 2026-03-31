@@ -53,6 +53,15 @@ export class Store {
     this.backupPath = `${this.storePath}.bak`;
     this.agentName = agentName || 'LettaBot';
     this.data = this.load();
+
+    // One-shot bootstrap: if the store has no agent ID yet, seed from env var.
+    // Persisted to disk so refresh() doesn't discard it.
+    // This is NOT a runtime fallback -- clearAgent() will genuinely clear it,
+    // and the env var won't leak across agents in multi-agent mode.
+    if (!this.agentData().agentId && process.env.LETTA_AGENT_ID) {
+      this.agentData().agentId = process.env.LETTA_AGENT_ID;
+      this.save();
+    }
   }
 
   /**
@@ -290,11 +299,6 @@ export class Store {
   }
 
   get agentId(): string | null {
-    // Keep legacy env var override only for default single-agent key.
-    // In multi-agent mode, a global LETTA_AGENT_ID would leak across agents.
-    if (this.agentName === 'LettaBot') {
-      return this.agentData().agentId || process.env.LETTA_AGENT_ID || null;
-    }
     return this.agentData().agentId || null;
   }
 

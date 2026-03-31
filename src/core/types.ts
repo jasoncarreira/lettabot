@@ -258,6 +258,12 @@ export interface BotConfig {
     showReasoning?: boolean;      // Show agent reasoning/thinking in channel output
     reasoningMaxChars?: number;   // Truncate reasoning to N chars (default: 0 = no limit)
   };
+  /** Per-channel display overrides. Keys are channel IDs (e.g. 'bluesky', 'telegram'). */
+  channelDisplay?: Record<string, {
+    showToolCalls?: boolean;
+    showReasoning?: boolean;
+    reasoningMaxChars?: number;
+  }>;
 
   // Skills
   skills?: SkillsConfig;
@@ -275,6 +281,9 @@ export interface BotConfig {
   sendFileDir?: string;     // Restrict <send-file> directive to this directory (default: data/outbound)
   sendFileMaxSize?: number; // Max file size in bytes for <send-file> (default: 50MB)
   sendFileCleanup?: boolean; // Allow <send-file cleanup="true"> to delete files after send (default: false)
+
+  // Auto-voice
+  autoVoice?: boolean; // Automatically generate a TTS voice memo for every text response (no <voice> directive needed)
 
   // Logging
   logging?: {
@@ -332,6 +341,7 @@ export interface StreamMsg {
  */
 export interface AgentStore {
   agentId: string | null;
+  agentCleared?: boolean; // Set when clearAgent() is called, prevents env var fallback
   conversationId?: string | null; // Current conversation ID (used in shared mode)
   conversations?: Record<string, string>; // Per-key conversation IDs (used in per-channel mode)
   baseUrl?: string; // Server URL this agent belongs to
