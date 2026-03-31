@@ -12,7 +12,7 @@
  */
 
 import type { StreamMsg } from './types.js';
-import { createLogger } from '../logger.js';
+import { createLogger, type Logger } from '../logger.js';
 
 const log = createLogger('DisplayPipeline');
 
@@ -104,12 +104,13 @@ function classifyResult(
   convKey: string,
   runIds: string[],
   fingerprints: Map<string, string>,
+  logger: Logger,
 ): 'fresh' | 'stale' | 'unknown' {
   if (runIds.length === 0) return 'unknown';
   const fingerprint = [...new Set(runIds)].sort().join(',');
   const previous = fingerprints.get(convKey);
   if (previous === fingerprint) {
-    log.warn(`Stale duplicate result detected (key=${convKey}, runIds=${fingerprint})`);
+    logger.warn(`Stale duplicate result detected (key=${convKey}, runIds=${fingerprint})`);
     return 'stale';
   }
   fingerprints.set(convKey, fingerprint);
@@ -141,6 +142,8 @@ export interface DisplayPipelineOptions {
   convKey: string;
   /** Shared fingerprint map for stale-result detection (instance-level, not module-level). */
   resultFingerprints: Map<string, string>;
+  /** Bot name for log context (e.g. "DisplayPipeline/MyAgent"). */
+  botName?: string;
 }
 
 /**
@@ -152,6 +155,7 @@ export async function* createDisplayPipeline(
   stream: AsyncIterable<StreamMsg>,
   opts: DisplayPipelineOptions,
 ): AsyncGenerator<DisplayEvent> {
+  const pipeLog = opts.botName ? createLogger('DisplayPipeline', opts.botName) : log;
   const { convKey, resultFingerprints } = opts;
 
   // ── Foreground run tracking ──
@@ -190,7 +194,7 @@ export async function* createDisplayPipeline(
     // Skip stream_event (low-level deltas, not semantic)
     if (msg.type === 'stream_event') continue;
 
-    log.trace(`raw: type=${msg.type} runIds=${eventRunIds.join(',') || 'none'} fg=${foregroundRunId || 'unlocked'}`);
+    pipeLog.trace(`raw: type=${msg.type} runIds=${eventRunIds.join(',') || 'none'} fg=${foregroundRunId || 'unlocked'}`);
 
     // ── Run ID filtering ──
     // Lock types: substantive events that prove this run is the foreground turn.
@@ -207,7 +211,7 @@ export async function* createDisplayPipeline(
       // display immediately instead of waiting for the first assistant event.
       foregroundRunId = eventRunIds[0];
       foregroundSource = msg.type;
-      log.info(`Foreground run locked: ${foregroundRunId} (source=${foregroundSource})`);
+      pipeLog.info(`Foreground run locked: ${foregroundRunId} (source=${foregroundSource})`);
       // Fall through to type transitions and dispatch for immediate processing.
     } else if (foregroundRunId === null && eventRunIds.length > 0 && !isLockType) {
       // Pre-foreground error/retry events are filtered. If passed through,
@@ -220,7 +224,7 @@ export async function* createDisplayPipeline(
       // (background Tasks don't produce assistant events in the foreground stream).
       if (msg.type === 'assistant') {
         const newRunId = eventRunIds[0];
-        log.info(`Foreground run rebind: ${foregroundRunId} -> ${newRunId}`);
+        pipeLog.info(`Foreground run rebind: ${foregroundRunId} -> ${newRunId}`);
         foregroundRunId = newRunId;
         foregroundSource = 'assistant';
       } else {
@@ -313,7 +317,7 @@ export async function* createDisplayPipeline(
         let finalText = assistantText;
         if (streamedTrimmed.length > 0 && resultTrimmed !== streamedTrimmed) {
           // Diverged — prefer streamed (avoid n-1 desync)
-          log.warn(`Result diverges from streamed (resultLen=${resultText.length}, streamLen=${assistantText.length}), preferring streamed`);
+          pipeLog.warn(`Result diverges from streamed (resultLen=${resultText.length}, streamLen=${assistantText.length}), preferring streamed`);
         } else if (streamedTrimmed.length === 0 && msg.success !== false && !msg.error) {
           // No streamed text — use result as fallback
           finalText = resultText;
@@ -321,11 +325,11 @@ export async function* createDisplayPipeline(
 
         // Classify
         const cancelled = (msg as any).stopReason === 'cancelled';
-        const staleState = classifyResult(convKey, runIds.length > 0 ? runIds : [...allRunIds], resultFingerprints);
+        const staleState = classifyResult(convKey, runIds.length > 0 ? runIds : [...allRunIds], resultFingerprints, pipeLog);
         const stale = staleState === 'stale';
 
         if (filteredCount > 0) {
-          log.info(`Filtered ${filteredCount} non-foreground event(s) (key=${convKey})`);
+          pipeLog.info(`Filtered ${filteredCount} non-foreground event(s) (key=${convKey})`);
         }
 
         yield {

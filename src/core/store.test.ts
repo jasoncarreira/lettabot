@@ -221,13 +221,16 @@ describe('Store', () => {
     expect(store.isServerMismatch('https://api.letta.com')).toBe(true);
   });
 
-  it('should not apply LETTA_AGENT_ID override to non-default agent keys', () => {
+  it('should not read LETTA_AGENT_ID from store getter (handled by main.ts)', () => {
     process.env.LETTA_AGENT_ID = 'global-agent';
-    const defaultStore = new Store(testStorePath, 'LettaBot');
-    const namedStore = new Store(testStorePath, 'Bot2');
+    const store = new Store(testStorePath, 'LettaBot');
 
-    expect(defaultStore.agentId).toBe('global-agent');
-    expect(namedStore.agentId).toBeNull();
+    // Seeded at construction time
+    expect(store.agentId).toBe('global-agent');
+
+    // clearAgent genuinely clears -- env var doesn't resurrect at runtime
+    store.clearAgent();
+    expect(store.agentId).toBeNull();
   });
 
   // Per-key conversation management

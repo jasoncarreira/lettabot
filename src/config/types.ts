@@ -104,6 +104,9 @@ export interface AgentConfig {
     sendFileMaxSize?: number; // Max file size in bytes for <send-file> (default: 50MB)
     sendFileCleanup?: boolean; // Allow <send-file cleanup="true"> to delete after send (default: false)
     display?: DisplayConfig;
+    /** Per-channel display overrides (keys are channel IDs: telegram, bluesky, etc.) */
+    channelDisplay?: Record<string, DisplayConfig>;
+    autoVoice?: boolean;           // Automatically generate TTS voice memo for every text response
     allowedTools?: string[];       // Per-agent tool whitelist (overrides global/env ALLOWED_TOOLS)
     disallowedTools?: string[];    // Per-agent tool blocklist (overrides global/env DISALLOWED_TOOLS)
     logging?: {
@@ -159,6 +162,8 @@ export interface LettaBotConfig {
     // model is configured on the Letta agent server-side, not in config
     // Kept as optional for backward compat (ignored if present in existing configs)
     model?: string;
+    /** Global working directory for runtime data (overridden by WORKING_DIR env var) */
+    workingDir?: string;
   };
 
   // BYOK providers (api mode only)

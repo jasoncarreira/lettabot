@@ -377,8 +377,11 @@ export async function getPendingApprovals(
     const client = getClient();
 
     // Prefer agent-level pending approval to avoid scanning stale history.
+    // Skip this fast path when a conversationId is provided, since the agent-level
+    // pending_approval is not conversation-scoped and could return approvals from
+    // a different conversation.
     // IMPORTANT: Must include 'agent.pending_approval' or the field won't be returned.
-    try {
+    if (!conversationId) try {
       const agentState = await client.agents.retrieve(agentId, {
         include: ['agent.pending_approval'],
       });
@@ -455,10 +458,12 @@ export async function getPendingApprovals(
       return [];
     }
 
-    // Fetch messages ONCE and scan for resolved + pending approvals
+    // Fetch messages ONCE and scan for resolved + pending approvals.
+    // Use desc order to get newest messages first -- approvals are at the tail.
     const messagesPage = await client.agents.messages.list(agentId, {
       conversation_id: conversationId,
       limit: 100,
+      order: 'desc',
     });
 
     const messages: Array<{ message_type?: string }> = [];
@@ -571,6 +576,60 @@ export async function rejectApproval(
       throw e;
     }
     log.error('Failed to reject approval:', e);
+    return false;
+  }
+}
+
+/**
+ * Approve one or more pending tool call approvals in a single API request.
+ * The Letta API expects all parallel tool_call_ids for a run together.
+ */
+export async function approvePendingApproval(
+  agentId: string,
+  approvals: {
+    toolCallId: string;
+    reason?: string;
+  } | Array<{
+    toolCallId: string;
+    reason?: string;
+  }>,
+  conversationId?: string
+): Promise<boolean> {
+  const approvalList = Array.isArray(approvals) ? approvals : [approvals];
+  if (approvalList.length === 0) return true;
+
+  try {
+    const client = getClient();
+    const defaultReason = 'Approved by user from chat command';
+
+    await client.agents.messages.create(agentId, {
+      messages: [{
+        type: 'approval',
+        approvals: approvalList.map(a => ({
+          approve: true,
+          tool_call_id: a.toolCallId,
+          type: 'approval' as const,
+          reason: a.reason || defaultReason,
+        })),
+      }],
+      streaming: false,
+    });
+
+    const ids = approvalList.map(a => a.toolCallId).join(', ');
+    log.info(`Approved ${approvalList.length} approval(s): ${ids}`);
+    return true;
+  } catch (e) {
+    const err = e as { status?: number; error?: { detail?: string } };
+    const detail = err?.error?.detail || '';
+    if (err?.status === 400 && detail.includes('No tool call is currently awaiting approval')) {
+      log.warn('Approval(s) already resolved');
+      return true;
+    }
+    if (err?.status === 429) {
+      log.error('Failed to approve approval:', e);
+      throw e;
+    }
+    log.error('Failed to approve approval:', e);
     return false;
   }
 }
@@ -815,11 +874,11 @@ export async function recoverOrphanedConversationApproval(
 
     const client = getClient();
     
-    // List recent messages from the conversation to find orphaned approvals.
-    // Default: 50 (fast path). Deep scan: 500 (for conversations with many approvals).
-    const scanLimit = deepScan ? 500 : 50;
-    log.info(`Scanning ${scanLimit} messages for orphaned approvals...`);
-    const messagesPage = await client.conversations.messages.list(conversationId, { limit: scanLimit });
+    // List recent messages (newest first) to find orphaned approvals.
+    // Pending approvals are always near the tail of the conversation.
+    const scanLimit = deepScan ? 100 : 30;
+    log.info(`Scanning ${scanLimit} most recent messages for orphaned approvals...`);
+    const messagesPage = await client.conversations.messages.list(conversationId, { limit: scanLimit, order: 'desc' });
     const messages: Array<Record<string, unknown>> = [];
     for await (const msg of messagesPage) {
       messages.push(msg as unknown as Record<string, unknown>);
@@ -925,6 +984,38 @@ export async function recoverOrphanedConversationApproval(
               streaming: false,
             });
           } catch (approvalError) {
+            // The message scan can find stale tool call IDs from earlier approval
+            // rounds on the same run (when approval responses fall outside the scan
+            // window). The server returns 400 with the expected IDs -- retry with those.
+            const errDetail = (approvalError as { error?: { detail?: string } })?.error?.detail || '';
+            const expectedMatch = errDetail.match(/Expected '\[([^\]]+)\]'/);
+            if (expectedMatch) {
+              const expectedIds = expectedMatch[1]
+                .split(',')
+                .map(s => s.trim().replace(/^'|'$/g, ''));
+              if (expectedIds.length > 0 && expectedIds[0]) {
+                log.info(`Retrying denial with server-expected IDs: ${expectedIds.join(', ')}`);
+                const retryResponses = expectedIds.map(id => ({
+                  approve: false as const,
+                  tool_call_id: id,
+                  type: 'approval' as const,
+                  reason: `Auto-denied: originating run was ${status}/${stopReason}`,
+                }));
+                try {
+                  await client.conversations.messages.create(conversationId, {
+                    messages: [{ type: 'approval', approvals: retryResponses }],
+                    streaming: false,
+                  });
+                  log.info(`Retry succeeded: denied ${expectedIds.length} approval(s) for run ${runId}`);
+                  recoveredCount += expectedIds.length;
+                  details.push(`Denied ${expectedIds.length} approval(s) from ${status} run ${runId} (retried with correct IDs)`);
+                  // Skip the original recovery count below
+                  continue;
+                } catch (retryError) {
+                  log.warn(`Retry also failed for run ${runId}:`, retryError);
+                }
+              }
+            }
             const approvalErrMsg = approvalError instanceof Error ? approvalError.message : String(approvalError);
             const toolCallIds = approvals.map(a => a.toolCallId).join(', ');
             log.warn(
