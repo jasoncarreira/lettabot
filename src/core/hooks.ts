@@ -204,7 +204,9 @@ export class MessageHookRunner {
     const timeoutMs = cfg.timeoutMs ?? DEFAULT_AWAIT_TIMEOUT_MS;
     const task = fn(ctx);
     if (mode === 'parallel') {
-      void this.invokeWithTimeout(task, timeoutMs);
+      void this.invokeWithTimeout(task, timeoutMs).catch(err => {
+        console.warn(`[Hooks] ${stageName} failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
       return;
     }
     try {
